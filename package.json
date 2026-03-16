@@ -1,0 +1,32 @@
+{
+  "name": "@isteamhq/mcp",
+  "version": "1.0.0",
+  "description": "MCP server for is.team — manage tasks via AI agents",
+  "type": "module",
+  "main": "./dist/index.js",
+  "bin": {
+    "is-team-mcp": "./bin/is-team-mcp.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js"
+  },
+  "keywords": ["mcp", "is-team", "project-management", "ai", "llm"],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "dist",
+    "bin"
+  ]
+}
