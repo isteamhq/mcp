@@ -46,6 +46,8 @@ const firebaseConfig = {
 let firebaseApp: FirebaseApp | null = null;
 let firestoreDb: ReturnType<typeof getFirestore> | null = null;
 let firebaseAuthenticated = false;
+let firebaseAuthTime = 0;
+const FIREBASE_TOKEN_TTL = 55 * 60 * 1000; // refresh 5 min before 1h expiry
 
 function getApp(): FirebaseApp {
   if (!firebaseApp) {
@@ -66,7 +68,10 @@ function getDb(): ReturnType<typeof getFirestore> {
  * Must be called before any Firestore subscription.
  */
 async function ensureFirebaseAuth(): Promise<void> {
-  if (firebaseAuthenticated) return;
+  const now = Date.now();
+  if (firebaseAuthenticated && (now - firebaseAuthTime) < FIREBASE_TOKEN_TTL) return;
+
+  process.stderr.write(`[mcp] ${firebaseAuthenticated ? "Refreshing" : "Authenticating"} Firebase token...\n`);
 
   const res = await fetch(`${BASE_URL}/api/llm/auth`, {
     headers: { Authorization: `Bearer ${API_TOKEN}` },
@@ -80,6 +85,8 @@ async function ensureFirebaseAuth(): Promise<void> {
   const auth = getAuth(getApp());
   await signInWithCustomToken(auth, customToken);
   firebaseAuthenticated = true;
+  firebaseAuthTime = now;
+  process.stderr.write("[mcp] Firebase authenticated.\n");
 }
 
 /* ------------------------------------------------------------------ */
@@ -100,6 +107,11 @@ const subscriptions = new Map<string, Subscription>();
 
 const CardIdArg = { cardId: z.string().describe("Board card ID (e.g. col-1773256154568)") };
 
+/** Accept both number and string inputs — MCP clients may send either */
+const zNum = (desc: string) => z.union([z.number(), z.string()]).transform(Number).describe(desc);
+const zNumOptional = (desc: string) => z.union([z.number(), z.string()]).transform(Number).optional().describe(desc);
+const zNumNullableOptional = (desc: string) => z.union([z.number(), z.string(), z.null()]).transform((v) => v === null ? null : Number(v)).optional().describe(desc);
+
 const CreateTaskSchema = {
   ...CardIdArg,
   title:       z.string().describe("Task title (required)"),
@@ -108,46 +120,46 @@ const CreateTaskSchema = {
   description: z.string().optional().describe("Plain text description"),
   assignee:    z.string().optional().describe("Workspace member UID to assign"),
   assignedBy:  z.string().optional().describe("Reporter UID"),
-  parentTask:  z.number().optional().describe("Parent task number in this card"),
+  parentTask:  zNumOptional("Parent task number in this card"),
   dueDate:     z.string().optional().describe("Due date (ISO, e.g. 2026-04-01)"),
   startDate:   z.string().optional().describe("Start date (ISO)"),
   labels:      z.array(z.string()).optional().describe("Label strings"),
-  storyPoints: z.number().optional().describe("Story point estimate"),
+  storyPoints: zNumOptional("Story point estimate"),
   color:       z.string().optional().describe("Task color"),
 };
 
 const UpdateTaskSchema = {
   ...CardIdArg,
-  taskNumber:  z.number().describe("Task number from the # column"),
+  taskNumber:  zNum("Task number from the # column"),
   title:       z.string().optional().describe("New title"),
   type:        z.enum(["task", "bug", "feature", "story"]).optional().describe("Task type"),
   priority:    z.enum(["low", "medium", "high"]).optional().describe("Priority level"),
   description: z.string().nullable().optional().describe("Description text, or null to clear"),
   assignee:    z.string().nullable().optional().describe("Member UID, or null to unassign"),
   assignedBy:  z.string().nullable().optional().describe("Reporter UID, or null to clear"),
-  parentTask:  z.number().nullable().optional().describe("Parent task number, or null to clear"),
+  parentTask:  zNumNullableOptional("Parent task number, or null to clear"),
   dueDate:     z.string().nullable().optional().describe("Due date, or null to clear"),
   startDate:   z.string().nullable().optional().describe("Start date, or null to clear"),
   labels:      z.array(z.string()).nullable().optional().describe("Labels, or null to clear"),
-  storyPoints: z.number().nullable().optional().describe("Story points, or null to clear"),
+  storyPoints: zNumNullableOptional("Story points, or null to clear"),
   color:       z.string().nullable().optional().describe("Color, or null to clear"),
   archived:    z.boolean().optional().describe("Archive or unarchive the task"),
 };
 
 const CompleteTaskSchema = {
   ...CardIdArg,
-  taskNumber: z.number().describe("Task number to mark as done"),
+  taskNumber: zNum("Task number to mark as done"),
 };
 
 const MoveTaskSchema = {
   ...CardIdArg,
-  taskNumber:      z.number().describe("Task number to move"),
+  taskNumber:      zNum("Task number to move"),
   targetCardTitle: z.string().describe("Target card name (case-insensitive, from Connected Cards)"),
 };
 
 const CommentSchema = {
   ...CardIdArg,
-  taskNumber: z.number().describe("Task number to comment on"),
+  taskNumber: zNum("Task number to comment on"),
   text:       z.string().describe("Comment text"),
 };
 
@@ -158,15 +170,15 @@ const ReadCardSchema = {
 
 const LogTimeSchema = {
   ...CardIdArg,
-  taskNumber:  z.number().describe("Task number to log time for"),
-  duration:    z.number().describe("Duration in seconds (60–86400). Example: 1800 = 30 min, 3600 = 1 hour"),
+  taskNumber:  zNum("Task number to log time for"),
+  duration:    zNum("Duration in seconds (60–86400). Example: 1800 = 30 min, 3600 = 1 hour"),
   description: z.string().optional().describe("What was done during this time (max 2000 chars)"),
   date:        z.string().optional().describe("Date for the worklog (YYYY-MM-DD). Defaults to today"),
 };
 
 const ReorderTasksSchema = {
   ...CardIdArg,
-  taskNumbers: z.array(z.number()).describe("All task numbers in desired order"),
+  taskNumbers: z.array(z.union([z.number(), z.string()]).transform(Number)).describe("All task numbers in desired order"),
 };
 
 const SubscribeCardSchema = {
@@ -190,7 +202,6 @@ const server = new McpServer(
     capabilities: {
       tools: {},
       logging: {},
-      experimental: { "claude/channel": {} },
     },
   },
 );
@@ -331,12 +342,21 @@ server.registerTool("subscribe_card", {
   // Start real-time listener
   const taskIds = new Set<string>();
   let initialLoad = true;
+  let pendingTimer: ReturnType<typeof setTimeout> | null = null;
+  const pendingNewTaskIds = new Set<string>();
 
-  const unsubscribe = onSnapshot(nodeRef, (snap) => {
-    if (!snap.exists()) return;
+  type TaskEntry = { id: string; title: string; taskNumber?: number; type?: string; priority?: string };
+
+  const SETTLE_DELAY_MS = 2000; // wait 2s to confirm task is actually dropped (not just dragged over)
+
+  const unsubscribe = onSnapshot(nodeRef, async (snap) => {
+    if (!snap.exists()) {
+      process.stderr.write(`[mcp] Snapshot for ${cardId}: document does not exist\n`);
+      return;
+    }
 
     const data = snap.data();
-    const nodeData = data?.data as { tasks?: Array<{ id: string; title: string; taskNumber?: number; type?: string; priority?: string }> } | undefined;
+    const nodeData = data?.data as { tasks?: TaskEntry[] } | undefined;
     const currentTasks = nodeData?.tasks ?? [];
 
     if (initialLoad) {
@@ -345,47 +365,89 @@ server.registerTool("subscribe_card", {
         taskIds.add(t.id);
       }
       initialLoad = false;
+      process.stderr.write(`[mcp] Subscription baseline set for ${cardId}: ${taskIds.size} tasks\n`);
       return;
     }
 
-    // Find new tasks
+    // Find new tasks (not in baseline and not already pending)
     const newTasks = currentTasks.filter((t) => !taskIds.has(t.id));
 
-    // Update baseline
-    taskIds.clear();
-    for (const t of currentTasks) {
-      taskIds.add(t.id);
+    // Track which task IDs are currently present (for settle check)
+    const currentTaskIdSet = new Set(currentTasks.map((t) => t.id));
+
+    // Remove pending tasks that disappeared (dragged away without dropping)
+    for (const pid of pendingNewTaskIds) {
+      if (!currentTaskIdSet.has(pid)) {
+        pendingNewTaskIds.delete(pid);
+        process.stderr.write(`[mcp] Task ${pid} left card ${cardId} (drag pass-through)\n`);
+      }
     }
 
-    // Notify for each new task via Channel (appears in conversation)
-    for (const task of newTasks) {
-      const msg = [
-        `New task on card "${cardId}":`,
-        `#${task.taskNumber ?? "?"} — ${task.title}`,
-        `Type: ${task.type ?? "task"} | Priority: ${task.priority ?? "medium"}`,
-        ``,
-        `Use read_card to see full details, then start working on it.`,
-      ].join("\n");
-
-      void server.server.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: msg,
-          meta: {
-            card_id: cardId,
-            task_number: String(task.taskNumber ?? ""),
-            priority: task.priority ?? "medium",
-          },
-        },
-      });
+    if (newTasks.length === 0) {
+      process.stderr.write(`[mcp] Snapshot for ${cardId}: ${currentTasks.length} tasks, no new\n`);
+      return;
     }
+
+    // Add new tasks to pending set
+    for (const t of newTasks) {
+      pendingNewTaskIds.add(t.id);
+    }
+
+    process.stderr.write(`[mcp] ${newTasks.length} new task(s) detected on ${cardId}, waiting ${SETTLE_DELAY_MS}ms to confirm...\n`);
+
+    // Reset settle timer — we wait for the snapshot to stabilize
+    if (pendingTimer) clearTimeout(pendingTimer);
+
+    // Capture current tasks for the settle callback
+    const tasksSnapshot = [...currentTasks];
+
+    pendingTimer = setTimeout(async () => {
+      pendingTimer = null;
+
+      // Only notify for tasks that are still pending (survived the settle period)
+      const confirmedTasks: TaskEntry[] = [];
+      for (const t of tasksSnapshot) {
+        if (pendingNewTaskIds.has(t.id)) {
+          confirmedTasks.push(t);
+          pendingNewTaskIds.delete(t.id);
+          taskIds.add(t.id); // Add to baseline
+        }
+      }
+
+      if (confirmedTasks.length === 0) {
+        process.stderr.write(`[mcp] All pending tasks left ${cardId} — no notification\n`);
+        return;
+      }
+
+      process.stderr.write(`[mcp] ${confirmedTasks.length} task(s) confirmed on ${cardId}, notifying...\n`);
+
+      for (const task of confirmedTasks) {
+        const msg = [
+          `New task on card "${cardId}":`,
+          `#${task.taskNumber ?? "?"} — ${task.title}`,
+          `Type: ${task.type ?? "task"} | Priority: ${task.priority ?? "medium"}`,
+          ``,
+          `Use read_card to see full details, then start working on it.`,
+        ].join("\n");
+
+        try {
+          await server.server.sendLoggingMessage({
+            level: "warning",
+            data: msg,
+          });
+          process.stderr.write(`[mcp] Notification sent for #${task.taskNumber ?? "?"}\n`);
+        } catch (err) {
+          process.stderr.write(`[mcp] Notification FAILED for #${task.taskNumber ?? "?"}: ${String(err)}\n`);
+        }
+      }
+    }, SETTLE_DELAY_MS);
   }, (err) => {
-    void server.server.notification({
-      method: "notifications/claude/channel",
-      params: {
-        content: `Subscription error for card ${cardId}: ${String(err)}`,
-        meta: { card_id: cardId, severity: "error" },
-      },
+    process.stderr.write(`[mcp] Firestore listener error for ${cardId}: ${String(err)}\n`);
+    server.server.sendLoggingMessage({
+      level: "error",
+      data: `Subscription error for card ${cardId}: ${String(err)}`,
+    }).catch((e) => {
+      process.stderr.write(`[mcp] Error notification also failed: ${String(e)}\n`);
     });
   });
 
