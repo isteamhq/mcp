@@ -107,10 +107,14 @@ const subscriptions = new Map<string, Subscription>();
 
 const CardIdArg = { cardId: z.string().describe("Board card ID (e.g. col-1773256154568)") };
 
-/** Accept both number and string inputs — MCP clients may send either */
-const zNum = (desc: string) => z.union([z.number(), z.string()]).transform(Number).describe(desc);
-const zNumOptional = (desc: string) => z.union([z.number(), z.string()]).transform(Number).optional().describe(desc);
-const zNumNullableOptional = (desc: string) => z.union([z.number(), z.string(), z.null()]).transform((v) => v === null ? null : Number(v)).optional().describe(desc);
+/** Accept both number and string inputs — MCP clients may send either.
+ *  z.preprocess casts before validation so the JSON Schema stays clean (type: number)
+ *  while still accepting string values that some MCP clients send. */
+const toNum = (v: unknown) => (typeof v === "string" ? Number(v) : v);
+const toNumOrNull = (v: unknown) => (v === null ? null : toNum(v));
+const zNum = (desc: string) => z.preprocess(toNum, z.number()).describe(desc);
+const zNumOptional = (desc: string) => z.preprocess(toNum, z.number()).optional().describe(desc);
+const zNumNullableOptional = (desc: string) => z.preprocess(toNumOrNull, z.number().nullable()).optional().describe(desc);
 
 const CreateTaskSchema = {
   ...CardIdArg,
@@ -178,7 +182,10 @@ const LogTimeSchema = {
 
 const ReorderTasksSchema = {
   ...CardIdArg,
-  taskNumbers: z.array(z.union([z.number(), z.string()]).transform(Number)).describe("All task numbers in desired order"),
+  taskNumbers: z.preprocess(
+    (v) => Array.isArray(v) ? v.map(toNum) : v,
+    z.array(z.number()),
+  ).describe("All task numbers in desired order"),
 };
 
 const SubscribeCardSchema = {
@@ -197,11 +204,12 @@ const UnsubscribeCardSchema = {
 /* ------------------------------------------------------------------ */
 
 const server = new McpServer(
-  { name: "is.team", version: "1.3.0" },
+  { name: "is.team", version: "1.4.2" },
   {
     capabilities: {
       tools: {},
       logging: {},
+      experimental: { "claude/channel": {} },
     },
   },
 );
@@ -313,7 +321,7 @@ server.registerTool("subscribe_card", {
   title: "Subscribe to Card",
   description: [
     "Start listening for new tasks on a card in real-time.",
-    "When a new task appears, you will receive a log notification with the task details.",
+    "When a new task appears, you will receive a channel notification with the task details.",
     "Use list_cards first — it returns workspaceId, boardId, and nodeId for each card.",
     "The subscription persists until you call unsubscribe_card or the session ends.",
   ].join(" "),
@@ -369,11 +377,19 @@ server.registerTool("subscribe_card", {
       return;
     }
 
+    // Track which task IDs are currently present
+    const currentTaskIdSet = new Set(currentTasks.map((t) => t.id));
+
+    // Remove departed tasks from baseline so they're detected as new if they return
+    for (const id of taskIds) {
+      if (!currentTaskIdSet.has(id)) {
+        taskIds.delete(id);
+        process.stderr.write(`[mcp] Task ${id} left card ${cardId} — removed from baseline\n`);
+      }
+    }
+
     // Find new tasks (not in baseline and not already pending)
     const newTasks = currentTasks.filter((t) => !taskIds.has(t.id));
-
-    // Track which task IDs are currently present (for settle check)
-    const currentTaskIdSet = new Set(currentTasks.map((t) => t.id));
 
     // Remove pending tasks that disappeared (dragged away without dropping)
     for (const pid of pendingNewTaskIds) {
@@ -431,21 +447,27 @@ server.registerTool("subscribe_card", {
         ].join("\n");
 
         try {
-          await server.server.sendLoggingMessage({
-            level: "warning",
-            data: msg,
+          await server.server.notification({
+            method: "notifications/claude/channel",
+            params: {
+              content: msg,
+              meta: { cardId, taskNumber: String(task.taskNumber ?? "?") },
+            },
           });
-          process.stderr.write(`[mcp] Notification sent for #${task.taskNumber ?? "?"}\n`);
+          process.stderr.write(`[mcp] Channel notification sent for #${task.taskNumber ?? "?"}\n`);
         } catch (err) {
-          process.stderr.write(`[mcp] Notification FAILED for #${task.taskNumber ?? "?"}: ${String(err)}\n`);
+          process.stderr.write(`[mcp] Channel notification FAILED for #${task.taskNumber ?? "?"}: ${String(err)}\n`);
         }
       }
     }, SETTLE_DELAY_MS);
   }, (err) => {
     process.stderr.write(`[mcp] Firestore listener error for ${cardId}: ${String(err)}\n`);
-    server.server.sendLoggingMessage({
-      level: "error",
-      data: `Subscription error for card ${cardId}: ${String(err)}`,
+    server.server.notification({
+      method: "notifications/claude/channel",
+      params: {
+        content: `Subscription error for card ${cardId}: ${String(err)}`,
+        meta: { cardId, error: "true" },
+      },
     }).catch((e) => {
       process.stderr.write(`[mcp] Error notification also failed: ${String(e)}\n`);
     });
