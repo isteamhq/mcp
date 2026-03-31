@@ -185,8 +185,14 @@ const UnsubscribeCardSchema = {
 /* ------------------------------------------------------------------ */
 
 const server = new McpServer(
-  { name: "is.team", version: "1.2.0" },
-  { capabilities: { tools: {}, logging: {} } },
+  { name: "is.team", version: "1.3.0" },
+  {
+    capabilities: {
+      tools: {},
+      logging: {},
+      experimental: { "claude/channel": {} },
+    },
+  },
 );
 
 /* ── list_cards ─────────────────────────────────────────────────── */
@@ -351,27 +357,35 @@ server.registerTool("subscribe_card", {
       taskIds.add(t.id);
     }
 
-    // Notify for each new task
+    // Notify for each new task via Channel (appears in conversation)
     for (const task of newTasks) {
       const msg = [
-        `🔔 New task on card "${cardId}":`,
-        `  #${task.taskNumber ?? "?"} — ${task.title}`,
-        `  Type: ${task.type ?? "task"} | Priority: ${task.priority ?? "medium"}`,
+        `New task on card "${cardId}":`,
+        `#${task.taskNumber ?? "?"} — ${task.title}`,
+        `Type: ${task.type ?? "task"} | Priority: ${task.priority ?? "medium"}`,
         ``,
         `Use read_card to see full details, then start working on it.`,
       ].join("\n");
 
-      void server.server.sendLoggingMessage({
-        level: "warning",
-        logger: "is.team",
-        data: msg,
+      void server.server.notification({
+        method: "notifications/claude/channel",
+        params: {
+          content: msg,
+          meta: {
+            card_id: cardId,
+            task_number: String(task.taskNumber ?? ""),
+            priority: task.priority ?? "medium",
+          },
+        },
       });
     }
   }, (err) => {
-    void server.server.sendLoggingMessage({
-      level: "error",
-      logger: "is.team",
-      data: `Subscription error for card ${cardId}: ${String(err)}`,
+    void server.server.notification({
+      method: "notifications/claude/channel",
+      params: {
+        content: `Subscription error for card ${cardId}: ${String(err)}`,
+        meta: { card_id: cardId, severity: "error" },
+      },
     });
   });
 
