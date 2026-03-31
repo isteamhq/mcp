@@ -47,6 +47,14 @@ export class IsTeamClient {
     return this.post(`${cardId}/comment`, { taskNumber, text });
   }
 
+  async reorderTasks(cardId: string, taskNumbers: number[]): Promise<string> {
+    return this.post(`${cardId}/reorder-tasks`, { taskNumbers });
+  }
+
+  async logTime(cardId: string, body: Record<string, unknown>): Promise<string> {
+    return this.post(`${cardId}/log-time`, body);
+  }
+
   private async post(path: string, body: Record<string, unknown>): Promise<string> {
     const res = await fetch(`${this.baseUrl}/llm/${path}`, {
       method: "POST",

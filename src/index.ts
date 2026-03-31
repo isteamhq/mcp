@@ -3,6 +3,15 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
+import { initializeApp } from "firebase/app";
+import {
+  getFirestore,
+  collection,
+  doc,
+  onSnapshot,
+  type Unsubscribe,
+} from "firebase/firestore";
+
 import { IsTeamClient } from "./api-client.js";
 
 /* ------------------------------------------------------------------ */
@@ -19,6 +28,45 @@ if (!API_TOKEN) {
 }
 
 const client = new IsTeamClient(BASE_URL, API_TOKEN);
+
+/* ------------------------------------------------------------------ */
+/*  Firebase (for real-time subscriptions)                             */
+/* ------------------------------------------------------------------ */
+
+const firebaseConfig = {
+  apiKey:            "AIzaSyAtVm8c_16pHqS7855CSuPwFpvRm7sD_RQ",
+  authDomain:        "auth.is.team",
+  projectId:         "isteam-3c6d7",
+  storageBucket:     "isteam-3c6d7.firebasestorage.app",
+  messagingSenderId: "874701522516",
+  appId:             "1:874701522516:web:11861df4a6b0860956cfc1",
+};
+
+let firebaseInitialized = false;
+let firestoreDb: ReturnType<typeof getFirestore> | null = null;
+
+function getDb(): ReturnType<typeof getFirestore> {
+  if (!firestoreDb) {
+    if (!firebaseInitialized) {
+      initializeApp(firebaseConfig);
+      firebaseInitialized = true;
+    }
+    firestoreDb = getFirestore();
+  }
+  return firestoreDb;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Subscription state                                                 */
+/* ------------------------------------------------------------------ */
+
+interface Subscription {
+  cardId:      string;
+  unsubscribe: Unsubscribe;
+  taskIds:     Set<string>;
+}
+
+const subscriptions = new Map<string, Subscription>();
 
 /* ------------------------------------------------------------------ */
 /*  Tool input schemas                                                 */
@@ -82,13 +130,37 @@ const ReadCardSchema = {
   user: z.string().optional().describe("Display name — personalizes the prompt for this user"),
 };
 
+const LogTimeSchema = {
+  ...CardIdArg,
+  taskNumber:  z.number().describe("Task number to log time for"),
+  duration:    z.number().describe("Duration in seconds (60–86400). Example: 1800 = 30 min, 3600 = 1 hour"),
+  description: z.string().optional().describe("What was done during this time (max 2000 chars)"),
+  date:        z.string().optional().describe("Date for the worklog (YYYY-MM-DD). Defaults to today"),
+};
+
+const ReorderTasksSchema = {
+  ...CardIdArg,
+  taskNumbers: z.array(z.number()).describe("All task numbers in desired order"),
+};
+
+const SubscribeCardSchema = {
+  ...CardIdArg,
+  workspaceId: z.string().describe("Workspace ID that contains the card"),
+  boardId:     z.string().describe("Board ID that contains the card"),
+  nodeId:      z.string().describe("Canvas node ID of the card"),
+};
+
+const UnsubscribeCardSchema = {
+  ...CardIdArg,
+};
+
 /* ------------------------------------------------------------------ */
 /*  McpServer setup                                                    */
 /* ------------------------------------------------------------------ */
 
 const server = new McpServer(
-  { name: "is.team", version: "1.0.0" },
-  { capabilities: { tools: {} } },
+  { name: "is.team", version: "1.1.0" },
+  { capabilities: { tools: {}, logging: {} } },
 );
 
 /* ── list_cards ─────────────────────────────────────────────────── */
@@ -170,9 +242,153 @@ server.registerTool("add_comment", {
   return { content: [{ type: "text" as const, text: result }] };
 });
 
+/* ── log_time ──────────────────────────────────────────────────── */
+server.registerTool("log_time", {
+  title: "Log Time",
+  description: "Records a worklog entry on a task. Duration is in seconds (e.g. 1800 = 30 min, 3600 = 1 hour). Requires Flow permission.",
+  inputSchema: LogTimeSchema,
+  annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+}, async (args) => {
+  const { cardId, ...body } = args;
+  const result = await client.logTime(cardId, body);
+  return { content: [{ type: "text" as const, text: result }] };
+});
+
+/* ── reorder_tasks ──────────────────────────────────────────────── */
+server.registerTool("reorder_tasks", {
+  title: "Reorder Tasks",
+  description: "Reorder tasks in a card. Provide all task numbers in the desired order.",
+  inputSchema: ReorderTasksSchema,
+  annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+}, async (args) => {
+  const result = await client.reorderTasks(args.cardId, args.taskNumbers);
+  return { content: [{ type: "text" as const, text: result }] };
+});
+
+/* ── subscribe_card ─────────────────────────────────────────────── */
+server.registerTool("subscribe_card", {
+  title: "Subscribe to Card",
+  description: [
+    "Start listening for new tasks on a card in real-time.",
+    "When a new task appears, you will receive a log notification with the task details.",
+    "Use list_cards + read_card first to get the workspaceId, boardId, and nodeId.",
+    "The subscription persists until you call unsubscribe_card or the session ends.",
+  ].join(" "),
+  inputSchema: SubscribeCardSchema,
+  annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+}, async (args) => {
+  const { cardId, workspaceId, boardId, nodeId } = args;
+
+  // Already subscribed?
+  if (subscriptions.has(cardId)) {
+    return { content: [{ type: "text" as const, text: `Already subscribed to card ${cardId}.` }] };
+  }
+
+  // Initialize Firebase if needed
+  const db = getDb();
+
+  // Read current tasks to establish baseline
+  const nodeRef = doc(
+    db,
+    "workspaces", workspaceId,
+    "boards", boardId,
+    "canvasNodes", nodeId,
+  );
+
+  // Start real-time listener
+  const taskIds = new Set<string>();
+  let initialLoad = true;
+
+  const unsubscribe = onSnapshot(nodeRef, (snap) => {
+    if (!snap.exists()) return;
+
+    const data = snap.data();
+    const nodeData = data?.data as { tasks?: Array<{ id: string; title: string; taskNumber?: number; type?: string; priority?: string }> } | undefined;
+    const currentTasks = nodeData?.tasks ?? [];
+
+    if (initialLoad) {
+      // Populate baseline — don't notify for existing tasks
+      for (const t of currentTasks) {
+        taskIds.add(t.id);
+      }
+      initialLoad = false;
+      return;
+    }
+
+    // Find new tasks
+    const newTasks = currentTasks.filter((t) => !taskIds.has(t.id));
+
+    // Update baseline
+    taskIds.clear();
+    for (const t of currentTasks) {
+      taskIds.add(t.id);
+    }
+
+    // Notify for each new task
+    for (const task of newTasks) {
+      const msg = [
+        `🔔 New task on card "${cardId}":`,
+        `  #${task.taskNumber ?? "?"} — ${task.title}`,
+        `  Type: ${task.type ?? "task"} | Priority: ${task.priority ?? "medium"}`,
+        ``,
+        `Use read_card to see full details, then start working on it.`,
+      ].join("\n");
+
+      void server.server.sendLoggingMessage({
+        level: "warning",
+        logger: "is.team",
+        data: msg,
+      });
+    }
+  }, (err) => {
+    void server.server.sendLoggingMessage({
+      level: "error",
+      logger: "is.team",
+      data: `Subscription error for card ${cardId}: ${String(err)}`,
+    });
+  });
+
+  subscriptions.set(cardId, { cardId, unsubscribe, taskIds });
+
+  return {
+    content: [{
+      type: "text" as const,
+      text: `Subscribed to card ${cardId}. You will be notified when new tasks appear.`,
+    }],
+  };
+});
+
+/* ── unsubscribe_card ───────────────────────────────────────────── */
+server.registerTool("unsubscribe_card", {
+  title: "Unsubscribe from Card",
+  description: "Stop listening for new tasks on a card. Cancels a previous subscribe_card.",
+  inputSchema: UnsubscribeCardSchema,
+  annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+}, async (args) => {
+  const sub = subscriptions.get(args.cardId);
+  if (!sub) {
+    return { content: [{ type: "text" as const, text: `Not subscribed to card ${args.cardId}.` }] };
+  }
+
+  sub.unsubscribe();
+  subscriptions.delete(args.cardId);
+
+  return { content: [{ type: "text" as const, text: `Unsubscribed from card ${args.cardId}.` }] };
+});
+
 /* ------------------------------------------------------------------ */
 /*  Start                                                              */
 /* ------------------------------------------------------------------ */
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
+
+// Cleanup subscriptions on exit
+process.on("SIGINT", () => {
+  for (const sub of subscriptions.values()) sub.unsubscribe();
+  process.exit(0);
+});
+process.on("SIGTERM", () => {
+  for (const sub of subscriptions.values()) sub.unsubscribe();
+  process.exit(0);
+});
