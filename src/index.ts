@@ -3,7 +3,8 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
-import { initializeApp } from "firebase/app";
+import { initializeApp, type FirebaseApp } from "firebase/app";
+import { getAuth, signInWithCustomToken } from "firebase/auth";
 import {
   getFirestore,
   collection,
@@ -42,18 +43,43 @@ const firebaseConfig = {
   appId:             "1:874701522516:web:11861df4a6b0860956cfc1",
 };
 
-let firebaseInitialized = false;
+let firebaseApp: FirebaseApp | null = null;
 let firestoreDb: ReturnType<typeof getFirestore> | null = null;
+let firebaseAuthenticated = false;
+
+function getApp(): FirebaseApp {
+  if (!firebaseApp) {
+    firebaseApp = initializeApp(firebaseConfig);
+  }
+  return firebaseApp;
+}
 
 function getDb(): ReturnType<typeof getFirestore> {
   if (!firestoreDb) {
-    if (!firebaseInitialized) {
-      initializeApp(firebaseConfig);
-      firebaseInitialized = true;
-    }
-    firestoreDb = getFirestore();
+    firestoreDb = getFirestore(getApp());
   }
   return firestoreDb;
+}
+
+/**
+ * Authenticate Firebase client SDK using a custom token from the API.
+ * Must be called before any Firestore subscription.
+ */
+async function ensureFirebaseAuth(): Promise<void> {
+  if (firebaseAuthenticated) return;
+
+  const res = await fetch(`${BASE_URL}/api/llm/auth`, {
+    headers: { Authorization: `Bearer ${API_TOKEN}` },
+  });
+
+  if (!res.ok) {
+    throw new Error(`Firebase auth failed: ${res.status} ${res.statusText}`);
+  }
+
+  const { customToken } = (await res.json()) as { customToken: string };
+  const auth = getAuth(getApp());
+  await signInWithCustomToken(auth, customToken);
+  firebaseAuthenticated = true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -284,7 +310,8 @@ server.registerTool("subscribe_card", {
     return { content: [{ type: "text" as const, text: `Already subscribed to card ${cardId}.` }] };
   }
 
-  // Initialize Firebase if needed
+  // Authenticate Firebase client SDK (uses custom token from API)
+  await ensureFirebaseAuth();
   const db = getDb();
 
   // Read current tasks to establish baseline
