@@ -271,7 +271,7 @@ server.registerTool("subscribe_card", {
   description: [
     "Start listening for new tasks on a card in real-time.",
     "When a new task appears, you will receive a log notification with the task details.",
-    "Use list_cards + read_card first to get the workspaceId, boardId, and nodeId.",
+    "Use list_cards first — it returns workspaceId, boardId, and nodeId for each card.",
     "The subscription persists until you call unsubscribe_card or the session ends.",
   ].join(" "),
   inputSchema: SubscribeCardSchema,
