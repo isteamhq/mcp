@@ -12,6 +12,14 @@ import {
   onSnapshot,
   type Unsubscribe,
 } from "firebase/firestore";
+import {
+  getDatabase,
+  ref as rtdbRef,
+  set as rtdbSet,
+  remove as rtdbRemove,
+  onDisconnect,
+  type Database,
+} from "firebase/database";
 
 import { IsTeamClient } from "./api-client.js";
 
@@ -41,10 +49,12 @@ const firebaseConfig = {
   storageBucket:     "isteam-3c6d7.firebasestorage.app",
   messagingSenderId: "874701522516",
   appId:             "1:874701522516:web:11861df4a6b0860956cfc1",
+  databaseURL:       "https://isteam-3c6d7-default-rtdb.europe-west1.firebasedatabase.app",
 };
 
 let firebaseApp: FirebaseApp | null = null;
 let firestoreDb: ReturnType<typeof getFirestore> | null = null;
+let realtimeDb: Database | null = null;
 let firebaseAuthenticated = false;
 let firebaseAuthTime = 0;
 const FIREBASE_TOKEN_TTL = 55 * 60 * 1000; // refresh 5 min before 1h expiry
@@ -61,6 +71,39 @@ function getDb(): ReturnType<typeof getFirestore> {
     firestoreDb = getFirestore(getApp());
   }
   return firestoreDb;
+}
+
+function getRtdb(): Database {
+  if (!realtimeDb) {
+    realtimeDb = getDatabase(getApp());
+  }
+  return realtimeDb;
+}
+
+const AI_PRESENCE_ROOT = "aiPresence";
+
+function getAuthUid(): string | null {
+  const auth = getAuth(getApp());
+  return auth.currentUser?.uid ?? null;
+}
+
+async function setAiPresence(workspaceId: string, nodeId: string): Promise<void> {
+  const uid = getAuthUid();
+  if (!uid) return;
+  const db = getRtdb();
+  const presenceRef = rtdbRef(db, `${AI_PRESENCE_ROOT}/${workspaceId}/${nodeId}/${uid}`);
+  await rtdbSet(presenceRef, { active: true, subscribedAt: Date.now() });
+  await onDisconnect(presenceRef).remove();
+  process.stderr.write(`[mcp] AI presence set for ${nodeId} (uid: ${uid})\n`);
+}
+
+async function clearAiPresence(workspaceId: string, nodeId: string): Promise<void> {
+  const uid = getAuthUid();
+  if (!uid) return;
+  const db = getRtdb();
+  const presenceRef = rtdbRef(db, `${AI_PRESENCE_ROOT}/${workspaceId}/${nodeId}/${uid}`);
+  await rtdbRemove(presenceRef);
+  process.stderr.write(`[mcp] AI presence cleared for ${nodeId}\n`);
 }
 
 /**
@@ -95,6 +138,8 @@ async function ensureFirebaseAuth(): Promise<void> {
 
 interface Subscription {
   cardId:      string;
+  workspaceId: string;
+  nodeId:      string;
   unsubscribe: Unsubscribe;
   taskIds:     Set<string>;
 }
@@ -204,7 +249,7 @@ const UnsubscribeCardSchema = {
 /* ------------------------------------------------------------------ */
 
 const server = new McpServer(
-  { name: "is.team", version: "1.4.2" },
+  { name: "is.team", version: "1.5.0" },
   {
     capabilities: {
       tools: {},
@@ -473,7 +518,10 @@ server.registerTool("subscribe_card", {
     });
   });
 
-  subscriptions.set(cardId, { cardId, unsubscribe, taskIds });
+  subscriptions.set(cardId, { cardId, workspaceId, nodeId, unsubscribe, taskIds });
+
+  // Set AI presence in Realtime Database (auto-cleans on disconnect)
+  await setAiPresence(workspaceId, nodeId);
 
   return {
     content: [{
@@ -496,6 +544,7 @@ server.registerTool("unsubscribe_card", {
   }
 
   sub.unsubscribe();
+  await clearAiPresence(sub.workspaceId, sub.nodeId);
   subscriptions.delete(args.cardId);
 
   return { content: [{ type: "text" as const, text: `Unsubscribed from card ${args.cardId}.` }] };
@@ -508,9 +557,12 @@ server.registerTool("unsubscribe_card", {
 const transport = new StdioServerTransport();
 await server.connect(transport);
 
-// Cleanup subscriptions on exit
-process.on("SIGINT", () => {
-  for (const sub of subscriptions.values()) sub.unsubscribe();
+// Cleanup subscriptions + AI presence on exit
+process.on("SIGINT", async () => {
+  for (const sub of subscriptions.values()) {
+    sub.unsubscribe();
+    await clearAiPresence(sub.workspaceId, sub.nodeId).catch(() => {});
+  }
   process.exit(0);
 });
 process.on("SIGTERM", () => {
