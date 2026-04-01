@@ -10,6 +10,9 @@ import {
   collection,
   doc,
   onSnapshot,
+  query,
+  orderBy,
+  limitToLast,
   type Unsubscribe,
 } from "firebase/firestore";
 import {
@@ -137,11 +140,13 @@ async function ensureFirebaseAuth(): Promise<void> {
 /* ------------------------------------------------------------------ */
 
 interface Subscription {
-  cardId:      string;
-  workspaceId: string;
-  nodeId:      string;
-  unsubscribe: Unsubscribe;
-  taskIds:     Set<string>;
+  cardId:          string;
+  workspaceId:     string;
+  boardId:         string;
+  nodeId:          string;
+  unsubscribe:     Unsubscribe;
+  chatUnsubscribe: Unsubscribe | null;
+  taskIds:         Set<string>;
 }
 
 const subscriptions = new Map<string, Subscription>();
@@ -249,7 +254,7 @@ const UnsubscribeCardSchema = {
 /* ------------------------------------------------------------------ */
 
 const server = new McpServer(
-  { name: "is.team", version: "1.5.0" },
+  { name: "is.team", version: "1.6.0" },
   {
     capabilities: {
       tools: {},
@@ -358,6 +363,34 @@ server.registerTool("reorder_tasks", {
   annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
 }, async (args) => {
   const result = await client.reorderTasks(args.cardId, args.taskNumbers);
+  return { content: [{ type: "text" as const, text: result }] };
+});
+
+/* ── chat_respond ──────────────────────────────────────────────── */
+server.registerTool("chat_respond", {
+  title: "Respond in Chat",
+  description: "Send a response in the card's AI chat. Use this when you receive a chat_message notification from a subscribed card. Your response will appear in the chat UI.",
+  inputSchema: {
+    ...CardIdArg,
+    content: z.string().describe("Your response message"),
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+}, async (args) => {
+  const result = await client.chatRespond(args.cardId, args.content);
+  return { content: [{ type: "text" as const, text: result }] };
+});
+
+/* ── chat_history ──────────────────────────────────────────────── */
+server.registerTool("chat_history", {
+  title: "Read Chat History",
+  description: "Read recent chat messages from a card's AI chat. Useful for understanding context before responding to a chat message.",
+  inputSchema: {
+    ...CardIdArg,
+    limit: z.preprocess(toNum, z.number()).optional().describe("Number of messages to retrieve (default 30, max 100)"),
+  },
+  annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+}, async (args) => {
+  const result = await client.chatHistory(args.cardId, args.limit);
   return { content: [{ type: "text" as const, text: result }] };
 });
 
@@ -518,7 +551,57 @@ server.registerTool("subscribe_card", {
     });
   });
 
-  subscriptions.set(cardId, { cardId, workspaceId, nodeId, unsubscribe, taskIds });
+  // ── Chat messages listener (MCP takes over AI chat) ──────────────────
+  const chatColRef = collection(
+    db,
+    "workspaces", workspaceId,
+    "boards", boardId,
+    "canvasNodes", nodeId,
+    "chatMessages",
+  );
+  const chatQuery = query(chatColRef, orderBy("timestamp", "asc"), limitToLast(1));
+  const subscribeStartTime = Date.now();
+  let lastProcessedChatTs = subscribeStartTime;
+
+  const chatUnsubscribe = onSnapshot(chatQuery, (snap) => {
+    if (snap.empty) return;
+
+    const latestDoc = snap.docs[snap.docs.length - 1];
+    const d = latestDoc.data();
+    const role = d.role as string;
+    const timestamp = (d.timestamp as number) ?? 0;
+    const content = (d.content as string) ?? "";
+    const senderName = (d.senderName as string) ?? "User";
+
+    // Only process new user messages that arrived after subscription started
+    if (role !== "user" || timestamp <= lastProcessedChatTs) return;
+    lastProcessedChatTs = timestamp;
+
+    process.stderr.write(`[mcp] Chat message from ${senderName} on ${cardId}: ${content.slice(0, 80)}...\n`);
+
+    const msg = [
+      `<channel source="is-team" cardId="${cardId}" type="chat_message">`,
+      `Chat message on card "${cardId}":`,
+      `[${senderName}]: ${content}`,
+      ``,
+      `Use chat_history for context if needed, then chat_respond to reply.`,
+      `</channel>`,
+    ].join("\n");
+
+    server.server.notification({
+      method: "notifications/claude/channel",
+      params: {
+        content: msg,
+        meta: { cardId, type: "chat_message", senderName },
+      },
+    }).catch((err) => {
+      process.stderr.write(`[mcp] Chat notification FAILED for ${cardId}: ${String(err)}\n`);
+    });
+  }, (err) => {
+    process.stderr.write(`[mcp] Chat listener error for ${cardId}: ${String(err)}\n`);
+  });
+
+  subscriptions.set(cardId, { cardId, workspaceId, boardId, nodeId, unsubscribe, chatUnsubscribe, taskIds });
 
   // Set AI presence in Realtime Database (auto-cleans on disconnect)
   await setAiPresence(workspaceId, nodeId);
@@ -526,7 +609,7 @@ server.registerTool("subscribe_card", {
   return {
     content: [{
       type: "text" as const,
-      text: `Subscribed to card ${cardId}. You will be notified when new tasks appear.`,
+      text: `Subscribed to card ${cardId}. You will be notified when new tasks appear and chat messages will be forwarded to you.`,
     }],
   };
 });
@@ -544,6 +627,7 @@ server.registerTool("unsubscribe_card", {
   }
 
   sub.unsubscribe();
+  if (sub.chatUnsubscribe) sub.chatUnsubscribe();
   await clearAiPresence(sub.workspaceId, sub.nodeId);
   subscriptions.delete(args.cardId);
 
@@ -561,11 +645,15 @@ await server.connect(transport);
 process.on("SIGINT", async () => {
   for (const sub of subscriptions.values()) {
     sub.unsubscribe();
+    if (sub.chatUnsubscribe) sub.chatUnsubscribe();
     await clearAiPresence(sub.workspaceId, sub.nodeId).catch(() => {});
   }
   process.exit(0);
 });
 process.on("SIGTERM", () => {
-  for (const sub of subscriptions.values()) sub.unsubscribe();
+  for (const sub of subscriptions.values()) {
+    sub.unsubscribe();
+    if (sub.chatUnsubscribe) sub.chatUnsubscribe();
+  }
   process.exit(0);
 });

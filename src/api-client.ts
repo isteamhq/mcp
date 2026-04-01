@@ -59,4 +59,12 @@ export class IsTeamClient {
   async logTime(cardId: string, body: Record<string, unknown>): Promise<string> {
     return this.executeTool("log_time", cardId, body);
   }
+
+  async chatRespond(cardId: string, content: string): Promise<string> {
+    return this.executeTool("chat_respond", cardId, { content });
+  }
+
+  async chatHistory(cardId: string, limit?: number): Promise<string> {
+    return this.executeTool("chat_history", cardId, { limit: limit ?? 30 });
+  }
 }
