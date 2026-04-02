@@ -119,7 +119,7 @@ async function ensureFirebaseAuth(): Promise<void> {
 
   process.stderr.write(`[mcp] ${firebaseAuthenticated ? "Refreshing" : "Authenticating"} Firebase token...\n`);
 
-  const res = await fetch(`${BASE_URL}/api/llm/auth`, {
+  const res = await fetch(`${BASE_URL}/api/mcp/auth`, {
     headers: { Authorization: `Bearer ${API_TOKEN}` },
   });
 
