@@ -90,14 +90,26 @@ function getAuthUid(): string | null {
   return auth.currentUser?.uid ?? null;
 }
 
-async function setAiPresence(workspaceId: string, nodeId: string): Promise<void> {
+const PRESENCE_HEARTBEAT_MS = 30_000; // re-write presence every 30s
+
+async function writePresence(workspaceId: string, nodeId: string): Promise<void> {
   const uid = getAuthUid();
   if (!uid) return;
   const db = getRtdb();
   const presenceRef = rtdbRef(db, `${AI_PRESENCE_ROOT}/${workspaceId}/${nodeId}/${uid}`);
   await rtdbSet(presenceRef, { active: true, subscribedAt: Date.now() });
   await onDisconnect(presenceRef).remove();
-  process.stderr.write(`[mcp] AI presence set for ${nodeId} (uid: ${uid})\n`);
+}
+
+async function setAiPresence(workspaceId: string, nodeId: string): Promise<ReturnType<typeof setInterval>> {
+  await writePresence(workspaceId, nodeId);
+  process.stderr.write(`[mcp] AI presence set for ${nodeId} (uid: ${getAuthUid()})\n`);
+  // Heartbeat: re-write presence periodically to survive RTDB reconnections
+  return setInterval(() => {
+    writePresence(workspaceId, nodeId).catch((e) =>
+      process.stderr.write(`[mcp] Presence heartbeat failed for ${nodeId}: ${String(e)}\n`),
+    );
+  }, PRESENCE_HEARTBEAT_MS);
 }
 
 async function clearAiPresence(workspaceId: string, nodeId: string): Promise<void> {
@@ -147,6 +159,7 @@ interface Subscription {
   unsubscribe:     Unsubscribe;
   chatUnsubscribe: Unsubscribe | null;
   taskIds:         Set<string>;
+  presenceInterval: ReturnType<typeof setInterval> | null;
 }
 
 const subscriptions = new Map<string, Subscription>();
@@ -601,10 +614,10 @@ server.registerTool("subscribe_card", {
     process.stderr.write(`[mcp] Chat listener error for ${cardId}: ${String(err)}\n`);
   });
 
-  subscriptions.set(cardId, { cardId, workspaceId, boardId, nodeId, unsubscribe, chatUnsubscribe, taskIds });
+  // Set AI presence in Realtime Database (auto-cleans on disconnect, heartbeat keeps alive)
+  const presenceInterval = await setAiPresence(workspaceId, nodeId);
 
-  // Set AI presence in Realtime Database (auto-cleans on disconnect)
-  await setAiPresence(workspaceId, nodeId);
+  subscriptions.set(cardId, { cardId, workspaceId, boardId, nodeId, unsubscribe, chatUnsubscribe, taskIds, presenceInterval });
 
   return {
     content: [{
@@ -628,6 +641,7 @@ server.registerTool("unsubscribe_card", {
 
   sub.unsubscribe();
   if (sub.chatUnsubscribe) sub.chatUnsubscribe();
+  if (sub.presenceInterval) clearInterval(sub.presenceInterval);
   await clearAiPresence(sub.workspaceId, sub.nodeId);
   subscriptions.delete(args.cardId);
 
@@ -646,6 +660,7 @@ process.on("SIGINT", async () => {
   for (const sub of subscriptions.values()) {
     sub.unsubscribe();
     if (sub.chatUnsubscribe) sub.chatUnsubscribe();
+    if (sub.presenceInterval) clearInterval(sub.presenceInterval);
     await clearAiPresence(sub.workspaceId, sub.nodeId).catch(() => {});
   }
   process.exit(0);
@@ -654,6 +669,7 @@ process.on("SIGTERM", () => {
   for (const sub of subscriptions.values()) {
     sub.unsubscribe();
     if (sub.chatUnsubscribe) sub.chatUnsubscribe();
+    if (sub.presenceInterval) clearInterval(sub.presenceInterval);
   }
   process.exit(0);
 });
