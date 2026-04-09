@@ -1,3 +1,10 @@
+// Redirect to setup wizard if "setup" is the first argument
+if (process.argv.includes("setup")) {
+  await import("./setup.js");
+  // setup.ts handles process.exit — this line is a safety net
+  await new Promise(() => {});
+}
+
 import { z } from "zod";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -18,9 +25,12 @@ import {
 import {
   getDatabase,
   ref as rtdbRef,
+  get as rtdbGet,
   set as rtdbSet,
+  update as rtdbUpdate,
   remove as rtdbRemove,
   onDisconnect,
+  onValue,
   type Database,
 } from "firebase/database";
 
@@ -40,6 +50,27 @@ if (!API_TOKEN) {
 }
 
 const client = new IsTeamClient(BASE_URL, API_TOKEN);
+
+/* ------------------------------------------------------------------ */
+/*  Agent Session Identity                                             */
+/* ------------------------------------------------------------------ */
+
+/** Generate a random 4-char alphanumeric ID (uppercase). */
+function generateAgentId(): string {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  let id = "";
+  for (let i = 0; i < 4; i++) id += chars[Math.floor(Math.random() * chars.length)];
+  return id;
+}
+
+const AGENT_ID    = generateAgentId();
+const SESSION_ID  = `ses-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+const AGENT_SESSION_ROOT = "agentSessions";
+
+/** Agent connection mode — always "streaming" since we can't reliably detect client channel support. */
+const agentMode: "streaming" | "tools" = "streaming";
+
+process.stderr.write(`\n🤖 Agent ID: ${AGENT_ID}\n\n`);
 
 /* ------------------------------------------------------------------ */
 /*  Firebase (for real-time subscriptions)                             */
@@ -145,6 +176,134 @@ async function ensureFirebaseAuth(): Promise<void> {
   firebaseAuthenticated = true;
   firebaseAuthTime = now;
   process.stderr.write("[mcp] Firebase authenticated.\n");
+}
+
+/* ------------------------------------------------------------------ */
+/*  Agent Session Presence                                             */
+/* ------------------------------------------------------------------ */
+
+/** Workspace IDs this agent has access to (populated after auth). */
+let agentWorkspaceIds: string[] = [];
+
+/** Active session watchers (one per workspace). */
+const sessionWatchers: Array<() => void> = [];
+const sessionHeartbeatIntervals: Array<ReturnType<typeof setInterval>> = [];
+
+async function writeAgentSession(workspaceId: string): Promise<void> {
+  const uid = getAuthUid();
+  if (!uid) return;
+  const db = getRtdb();
+
+  // Remove any existing sessions from the same token/uid (one token = one agent)
+  const wsRef = rtdbRef(db, `${AGENT_SESSION_ROOT}/${workspaceId}`);
+  const snap = await rtdbGet(wsRef);
+  if (snap.exists()) {
+    const sessions = snap.val() as Record<string, { uid?: string }>;
+    for (const [sid, data] of Object.entries(sessions)) {
+      if (data.uid === uid && sid !== SESSION_ID) {
+        await rtdbRemove(rtdbRef(db, `${AGENT_SESSION_ROOT}/${workspaceId}/${sid}`));
+        process.stderr.write(`[mcp] Removed existing session ${sid} for same token\n`);
+      }
+    }
+  }
+
+  const sessionRef = rtdbRef(db, `${AGENT_SESSION_ROOT}/${workspaceId}/${SESSION_ID}`);
+  const sessionData = {
+    uid,
+    agentId: AGENT_ID,
+    mode: agentMode,
+    status: "idle",
+    assignedCard: null,
+    connectedAt: Date.now(),
+    lastHeartbeat: Date.now(),
+  };
+  await rtdbSet(sessionRef, sessionData);
+  await onDisconnect(sessionRef).remove();
+}
+
+async function updateSessionHeartbeat(workspaceId: string): Promise<void> {
+  const db = getRtdb();
+  const sessionRef = rtdbRef(db, `${AGENT_SESSION_ROOT}/${workspaceId}/${SESSION_ID}`);
+  await rtdbUpdate(sessionRef, { lastHeartbeat: Date.now() });
+}
+
+async function updateSessionStatus(workspaceId: string, status: "idle" | "subscribed", assignedCard: { cardId: string; boardId: string; nodeId: string } | null): Promise<void> {
+  const db = getRtdb();
+  const sessionRef = rtdbRef(db, `${AGENT_SESSION_ROOT}/${workspaceId}/${SESSION_ID}`);
+  await rtdbUpdate(sessionRef, { status, assignedCard, lastHeartbeat: Date.now() });
+}
+
+async function clearAgentSession(workspaceId: string): Promise<void> {
+  const db = getRtdb();
+  const sessionRef = rtdbRef(db, `${AGENT_SESSION_ROOT}/${workspaceId}/${SESSION_ID}`);
+  await rtdbRemove(sessionRef);
+}
+
+async function clearAllAgentSessions(): Promise<void> {
+  for (const wsId of agentWorkspaceIds) {
+    await clearAgentSession(wsId).catch(() => {});
+  }
+}
+
+/**
+ * Start agent session presence for all accessible workspaces.
+ * Also watches each session for UI-driven card assignment.
+ */
+async function startAgentSessions(workspaceIds: string[]): Promise<void> {
+  agentWorkspaceIds = workspaceIds;
+
+  for (const wsId of workspaceIds) {
+    await writeAgentSession(wsId);
+    process.stderr.write(`[mcp] Agent session registered in workspace ${wsId} (${AGENT_ID})\n`);
+
+    // Heartbeat
+    const hbInterval = setInterval(() => {
+      updateSessionHeartbeat(wsId).catch((e) =>
+        process.stderr.write(`[mcp] Session heartbeat failed for ${wsId}: ${String(e)}\n`),
+      );
+    }, PRESENCE_HEARTBEAT_MS);
+    sessionHeartbeatIntervals.push(hbInterval);
+
+    // Watch for UI-driven card assignment
+    const db = getRtdb();
+    const sessionRef = rtdbRef(db, `${AGENT_SESSION_ROOT}/${wsId}/${SESSION_ID}`);
+    let prevAssignedNodeId: string | null = null;
+
+    const unsub = onValue(sessionRef, async (snap) => {
+      if (!snap.exists()) return;
+      const val = snap.val() as {
+        status?: string;
+        assignedCard?: { cardId: string; boardId: string; nodeId: string } | null;
+      };
+
+      const newNodeId = val.assignedCard?.nodeId ?? null;
+
+      // UI assigned a card while agent is idle → auto-subscribe
+      if (newNodeId && !prevAssignedNodeId && val.status === "idle" && val.assignedCard) {
+        prevAssignedNodeId = newNodeId;
+        process.stderr.write(`[mcp] UI assigned card ${val.assignedCard.cardId} — auto-subscribing...\n`);
+        await performSubscribe(val.assignedCard.cardId, wsId, val.assignedCard.boardId, val.assignedCard.nodeId, true);
+      }
+
+      // UI removed card assignment while agent is subscribed → auto-unsubscribe
+      if (!newNodeId && prevAssignedNodeId) {
+        const oldCardId = findCardIdByNodeId(prevAssignedNodeId);
+        prevAssignedNodeId = null;
+        if (oldCardId) {
+          process.stderr.write(`[mcp] UI removed card assignment — auto-unsubscribing ${oldCardId}...\n`);
+          await performUnsubscribe(oldCardId, true);
+        }
+      }
+    });
+    sessionWatchers.push(unsub);
+  }
+}
+
+function findCardIdByNodeId(nodeId: string): string | null {
+  for (const [cardId, sub] of subscriptions) {
+    if (sub.nodeId === nodeId) return cardId;
+  }
+  return null;
 }
 
 /* ------------------------------------------------------------------ */
@@ -267,7 +426,7 @@ const UnsubscribeCardSchema = {
 /* ------------------------------------------------------------------ */
 
 const server = new McpServer(
-  { name: "is.team", version: "1.6.0" },
+  { name: "is.team", version: "1.7.0" },
   {
     capabilities: {
       tools: {},
@@ -407,46 +566,34 @@ server.registerTool("chat_history", {
   return { content: [{ type: "text" as const, text: result }] };
 });
 
-/* ── subscribe_card ─────────────────────────────────────────────── */
-server.registerTool("subscribe_card", {
-  title: "Subscribe to Card",
-  description: [
-    "Start listening for new tasks on a card in real-time.",
-    "When a new task appears, you will receive a channel notification with the task details.",
-    "Use list_cards first — it returns workspaceId, boardId, and nodeId for each card.",
-    "The subscription persists until you call unsubscribe_card or the session ends.",
-  ].join(" "),
-  inputSchema: SubscribeCardSchema,
-  annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-}, async (args) => {
-  const { cardId, workspaceId, boardId, nodeId } = args;
+/* ------------------------------------------------------------------ */
+/*  Shared subscribe / unsubscribe logic                               */
+/* ------------------------------------------------------------------ */
 
-  // Already subscribed?
+type TaskEntry = { id: string; title: string; taskNumber?: number; type?: string; priority?: string };
+
+/**
+ * Core subscription logic — used by both the `subscribe_card` tool and
+ * UI-driven assignment via the agentSessions watcher.
+ *
+ * @param fromUI  If true, the subscription was triggered by the UI (badge drop).
+ *                Session doc is updated but status change is skipped (UI already wrote it).
+ */
+async function performSubscribe(cardId: string, workspaceId: string, boardId: string, nodeId: string, fromUI = false): Promise<string> {
   if (subscriptions.has(cardId)) {
-    return { content: [{ type: "text" as const, text: `Already subscribed to card ${cardId}.` }] };
+    return `Already subscribed to card ${cardId}.`;
   }
 
-  // Authenticate Firebase client SDK (uses custom token from API)
   await ensureFirebaseAuth();
   const db = getDb();
 
-  // Read current tasks to establish baseline
-  const nodeRef = doc(
-    db,
-    "workspaces", workspaceId,
-    "boards", boardId,
-    "canvasNodes", nodeId,
-  );
+  const nodeRef = doc(db, "workspaces", workspaceId, "boards", boardId, "canvasNodes", nodeId);
 
-  // Start real-time listener
   const taskIds = new Set<string>();
   let initialLoad = true;
   let pendingTimer: ReturnType<typeof setTimeout> | null = null;
   const pendingNewTaskIds = new Set<string>();
-
-  type TaskEntry = { id: string; title: string; taskNumber?: number; type?: string; priority?: string };
-
-  const SETTLE_DELAY_MS = 2000; // wait 2s to confirm task is actually dropped (not just dragged over)
+  const SETTLE_DELAY_MS = 2000;
 
   const unsubscribe = onSnapshot(nodeRef, async (snap) => {
     if (!snap.exists()) {
@@ -459,19 +606,14 @@ server.registerTool("subscribe_card", {
     const currentTasks = nodeData?.tasks ?? [];
 
     if (initialLoad) {
-      // Populate baseline — don't notify for existing tasks
-      for (const t of currentTasks) {
-        taskIds.add(t.id);
-      }
+      for (const t of currentTasks) taskIds.add(t.id);
       initialLoad = false;
       process.stderr.write(`[mcp] Subscription baseline set for ${cardId}: ${taskIds.size} tasks\n`);
       return;
     }
 
-    // Track which task IDs are currently present
     const currentTaskIdSet = new Set(currentTasks.map((t) => t.id));
 
-    // Remove departed tasks from baseline so they're detected as new if they return
     for (const id of taskIds) {
       if (!currentTaskIdSet.has(id)) {
         taskIds.delete(id);
@@ -479,10 +621,8 @@ server.registerTool("subscribe_card", {
       }
     }
 
-    // Find new tasks (not in baseline and not already pending)
     const newTasks = currentTasks.filter((t) => !taskIds.has(t.id));
 
-    // Remove pending tasks that disappeared (dragged away without dropping)
     for (const pid of pendingNewTaskIds) {
       if (!currentTaskIdSet.has(pid)) {
         pendingNewTaskIds.delete(pid);
@@ -495,37 +635,27 @@ server.registerTool("subscribe_card", {
       return;
     }
 
-    // Add new tasks to pending set
-    for (const t of newTasks) {
-      pendingNewTaskIds.add(t.id);
-    }
+    for (const t of newTasks) pendingNewTaskIds.add(t.id);
 
     process.stderr.write(`[mcp] ${newTasks.length} new task(s) detected on ${cardId}, waiting ${SETTLE_DELAY_MS}ms to confirm...\n`);
 
-    // Reset settle timer — we wait for the snapshot to stabilize
     if (pendingTimer) clearTimeout(pendingTimer);
-
-    // Capture current tasks for the settle callback
     const tasksSnapshot = [...currentTasks];
 
     pendingTimer = setTimeout(async () => {
       pendingTimer = null;
-
-      // Only notify for tasks that are still pending (survived the settle period)
       const confirmedTasks: TaskEntry[] = [];
       for (const t of tasksSnapshot) {
         if (pendingNewTaskIds.has(t.id)) {
           confirmedTasks.push(t);
           pendingNewTaskIds.delete(t.id);
-          taskIds.add(t.id); // Add to baseline
+          taskIds.add(t.id);
         }
       }
-
       if (confirmedTasks.length === 0) {
         process.stderr.write(`[mcp] All pending tasks left ${cardId} — no notification\n`);
         return;
       }
-
       process.stderr.write(`[mcp] ${confirmedTasks.length} task(s) confirmed on ${cardId}, notifying...\n`);
 
       for (const task of confirmedTasks) {
@@ -540,10 +670,7 @@ server.registerTool("subscribe_card", {
         try {
           await server.server.notification({
             method: "notifications/claude/channel",
-            params: {
-              content: msg,
-              meta: { cardId, taskNumber: String(task.taskNumber ?? "?") },
-            },
+            params: { content: msg, meta: { cardId, taskNumber: String(task.taskNumber ?? "?") } },
           });
           process.stderr.write(`[mcp] Channel notification sent for #${task.taskNumber ?? "?"}\n`);
         } catch (err) {
@@ -555,30 +682,19 @@ server.registerTool("subscribe_card", {
     process.stderr.write(`[mcp] Firestore listener error for ${cardId}: ${String(err)}\n`);
     server.server.notification({
       method: "notifications/claude/channel",
-      params: {
-        content: `Subscription error for card ${cardId}: ${String(err)}`,
-        meta: { cardId, error: "true" },
-      },
+      params: { content: `Subscription error for card ${cardId}: ${String(err)}`, meta: { cardId, error: "true" } },
     }).catch((e) => {
       process.stderr.write(`[mcp] Error notification also failed: ${String(e)}\n`);
     });
   });
 
-  // ── Chat messages listener (MCP takes over AI chat) ──────────────────
-  const chatColRef = collection(
-    db,
-    "workspaces", workspaceId,
-    "boards", boardId,
-    "canvasNodes", nodeId,
-    "chatMessages",
-  );
+  // Chat messages listener
+  const chatColRef = collection(db, "workspaces", workspaceId, "boards", boardId, "canvasNodes", nodeId, "chatMessages");
   const chatQuery = query(chatColRef, orderBy("timestamp", "asc"), limitToLast(1));
-  const subscribeStartTime = Date.now();
-  let lastProcessedChatTs = subscribeStartTime;
+  let lastProcessedChatTs = Date.now();
 
   const chatUnsubscribe = onSnapshot(chatQuery, (snap) => {
     if (snap.empty) return;
-
     const latestDoc = snap.docs[snap.docs.length - 1];
     const d = latestDoc.data();
     const role = d.role as string;
@@ -586,7 +702,6 @@ server.registerTool("subscribe_card", {
     const content = (d.content as string) ?? "";
     const senderName = (d.senderName as string) ?? "User";
 
-    // Only process new user messages that arrived after subscription started
     if (role !== "user" || timestamp <= lastProcessedChatTs) return;
     lastProcessedChatTs = timestamp;
 
@@ -603,10 +718,7 @@ server.registerTool("subscribe_card", {
 
     server.server.notification({
       method: "notifications/claude/channel",
-      params: {
-        content: msg,
-        meta: { cardId, type: "chat_message", senderName },
-      },
+      params: { content: msg, meta: { cardId, type: "chat_message", senderName } },
     }).catch((err) => {
       process.stderr.write(`[mcp] Chat notification FAILED for ${cardId}: ${String(err)}\n`);
     });
@@ -614,17 +726,66 @@ server.registerTool("subscribe_card", {
     process.stderr.write(`[mcp] Chat listener error for ${cardId}: ${String(err)}\n`);
   });
 
-  // Set AI presence in Realtime Database (auto-cleans on disconnect, heartbeat keeps alive)
+  // AI presence (per-card, existing system)
   const presenceInterval = await setAiPresence(workspaceId, nodeId);
 
   subscriptions.set(cardId, { cardId, workspaceId, boardId, nodeId, unsubscribe, chatUnsubscribe, taskIds, presenceInterval });
 
-  return {
-    content: [{
-      type: "text" as const,
-      text: `Subscribed to card ${cardId}. You will be notified when new tasks appear and chat messages will be forwarded to you.`,
-    }],
-  };
+  // Update agent session status
+  if (!fromUI) {
+    // Tool-based subscribe: update session with card info
+    updateSessionStatus(workspaceId, "subscribed", { cardId, boardId, nodeId }).catch((e) =>
+      process.stderr.write(`[mcp] Failed to update session status: ${String(e)}\n`),
+    );
+  } else {
+    // UI-driven: just set status to subscribed (assignedCard is already set by UI)
+    const db2 = getRtdb();
+    rtdbUpdate(rtdbRef(db2, `${AGENT_SESSION_ROOT}/${workspaceId}/${SESSION_ID}`), { status: "subscribed", lastHeartbeat: Date.now() }).catch((e) =>
+      process.stderr.write(`[mcp] Failed to update session status: ${String(e)}\n`),
+    );
+  }
+
+  return `Subscribed to card ${cardId}. You will be notified when new tasks appear and chat messages will be forwarded to you.`;
+}
+
+/**
+ * Core unsubscription logic.
+ * @param fromUI  If true, the unsubscription was triggered by the UI (badge click).
+ */
+async function performUnsubscribe(cardId: string, fromUI = false): Promise<string> {
+  const sub = subscriptions.get(cardId);
+  if (!sub) return `Not subscribed to card ${cardId}.`;
+
+  sub.unsubscribe();
+  if (sub.chatUnsubscribe) sub.chatUnsubscribe();
+  if (sub.presenceInterval) clearInterval(sub.presenceInterval);
+  await clearAiPresence(sub.workspaceId, sub.nodeId);
+  subscriptions.delete(cardId);
+
+  // Update agent session
+  if (!fromUI) {
+    updateSessionStatus(sub.workspaceId, "idle", null).catch((e) =>
+      process.stderr.write(`[mcp] Failed to update session status: ${String(e)}\n`),
+    );
+  }
+
+  return `Unsubscribed from card ${cardId}.`;
+}
+
+/* ── subscribe_card ─────────────────────────────────────────────── */
+server.registerTool("subscribe_card", {
+  title: "Subscribe to Card",
+  description: [
+    "Start listening for new tasks on a card in real-time.",
+    "When a new task appears, you will receive a channel notification with the task details.",
+    "Use list_cards first — it returns workspaceId, boardId, and nodeId for each card.",
+    "The subscription persists until you call unsubscribe_card or the session ends.",
+  ].join(" "),
+  inputSchema: SubscribeCardSchema,
+  annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+}, async (args) => {
+  const text = await performSubscribe(args.cardId, args.workspaceId, args.boardId, args.nodeId);
+  return { content: [{ type: "text" as const, text }] };
 });
 
 /* ── unsubscribe_card ───────────────────────────────────────────── */
@@ -634,18 +795,8 @@ server.registerTool("unsubscribe_card", {
   inputSchema: UnsubscribeCardSchema,
   annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
 }, async (args) => {
-  const sub = subscriptions.get(args.cardId);
-  if (!sub) {
-    return { content: [{ type: "text" as const, text: `Not subscribed to card ${args.cardId}.` }] };
-  }
-
-  sub.unsubscribe();
-  if (sub.chatUnsubscribe) sub.chatUnsubscribe();
-  if (sub.presenceInterval) clearInterval(sub.presenceInterval);
-  await clearAiPresence(sub.workspaceId, sub.nodeId);
-  subscriptions.delete(args.cardId);
-
-  return { content: [{ type: "text" as const, text: `Unsubscribed from card ${args.cardId}.` }] };
+  const text = await performUnsubscribe(args.cardId);
+  return { content: [{ type: "text" as const, text }] };
 });
 
 /* ------------------------------------------------------------------ */
@@ -655,21 +806,70 @@ server.registerTool("unsubscribe_card", {
 const transport = new StdioServerTransport();
 await server.connect(transport);
 
-// Cleanup subscriptions + AI presence on exit
-process.on("SIGINT", async () => {
+// Register agent session presence after connecting (async, non-blocking)
+(async () => {
+  try {
+    await ensureFirebaseAuth();
+
+    // Fetch workspace IDs from auth endpoint
+    const authRes = await fetch(`${BASE_URL}/api/mcp/auth`, {
+      headers: { Authorization: `Bearer ${API_TOKEN}` },
+    });
+    if (authRes.ok) {
+      const authData = (await authRes.json()) as { customToken: string; workspaceIds?: string[] };
+      let wsIds = authData.workspaceIds ?? [];
+
+      // Fallback: if auth endpoint doesn't return workspaceIds yet,
+      // discover them via list_cards exec endpoint (returns JSON with cards[].workspaceId)
+      if (wsIds.length === 0) {
+        try {
+          const execRes = await fetch(`${BASE_URL}/api/mcp/exec`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${API_TOKEN}`, "Content-Type": "application/json" },
+            body: JSON.stringify({ tool: "list_cards" }),
+          });
+          if (execRes.ok) {
+            const json = (await execRes.json()) as { cards?: Array<{ workspaceId?: string }> };
+            const ids = new Set<string>();
+            for (const c of json.cards ?? []) {
+              if (c.workspaceId) ids.add(c.workspaceId);
+            }
+            wsIds = [...ids];
+          }
+        } catch {
+          process.stderr.write("[mcp] Fallback workspace discovery failed.\n");
+        }
+      }
+
+      if (wsIds.length > 0) {
+        await startAgentSessions(wsIds);
+      } else {
+        process.stderr.write("[mcp] No workspaces found for agent session presence.\n");
+      }
+    }
+  } catch (e) {
+    process.stderr.write(`[mcp] Failed to start agent sessions: ${String(e)}\n`);
+  }
+})();
+
+// Cleanup subscriptions + AI presence + agent sessions on exit
+async function cleanup(): Promise<void> {
   for (const sub of subscriptions.values()) {
     sub.unsubscribe();
     if (sub.chatUnsubscribe) sub.chatUnsubscribe();
     if (sub.presenceInterval) clearInterval(sub.presenceInterval);
     await clearAiPresence(sub.workspaceId, sub.nodeId).catch(() => {});
   }
+  for (const unsub of sessionWatchers) unsub();
+  for (const interval of sessionHeartbeatIntervals) clearInterval(interval);
+  await clearAllAgentSessions();
+}
+
+process.on("SIGINT", async () => {
+  await cleanup();
   process.exit(0);
 });
-process.on("SIGTERM", () => {
-  for (const sub of subscriptions.values()) {
-    sub.unsubscribe();
-    if (sub.chatUnsubscribe) sub.chatUnsubscribe();
-    if (sub.presenceInterval) clearInterval(sub.presenceInterval);
-  }
+process.on("SIGTERM", async () => {
+  await cleanup();
   process.exit(0);
 });
