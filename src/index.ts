@@ -695,6 +695,22 @@ registerIntegrationTool("slack_send_thread_reply", "Slack: Reply in Thread",
     threadTs: z.string().describe("Thread timestamp (ts) of the parent message"),
     text: z.string().describe("Reply text"),
   }, false);
+registerIntegrationTool("slack_create_channel", "Slack: Create Channel",
+  "Create a new Slack channel.", {
+    name: z.string().describe("Channel name (lowercase, hyphens allowed)"),
+    isPrivate: z.boolean().optional().describe("Create as private channel (default: false)"),
+  }, false);
+registerIntegrationTool("slack_archive_channel", "Slack: Archive Channel",
+  "Archive a Slack channel.", {
+    channel: z.string().describe("Channel ID"),
+  }, false);
+registerIntegrationTool("slack_update_channel", "Slack: Update Channel",
+  "Rename a channel or update its topic/purpose.", {
+    channel: z.string().describe("Channel ID"),
+    name: z.string().optional().describe("New channel name"),
+    topic: z.string().optional().describe("New channel topic"),
+    purpose: z.string().optional().describe("New channel purpose"),
+  }, false);
 registerIntegrationTool("slack_get_channel_history", "Slack: Channel History",
   "Read recent messages from a Slack channel.", {
     channel: z.string().describe("Channel ID"),
