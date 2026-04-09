@@ -67,4 +67,22 @@ export class IsTeamClient {
   async chatHistory(cardId: string, limit?: number): Promise<string> {
     return this.executeTool("chat_history", cardId, { limit: limit ?? 30 });
   }
+
+  /* ── Workspace-scoped integration tools ────────────────────────── */
+
+  async executeIntegrationTool(tool: string, workspaceId: string, args?: Record<string, unknown>): Promise<string> {
+    const res = await fetch(`${this.baseUrl}/api/mcp/exec`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ tool, workspaceId, args: args ?? {} }),
+    });
+    return res.text();
+  }
+
+  async listIntegrations(workspaceId: string): Promise<string> {
+    return this.executeIntegrationTool("list_integrations", workspaceId);
+  }
 }

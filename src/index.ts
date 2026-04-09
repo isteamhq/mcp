@@ -426,7 +426,7 @@ const UnsubscribeCardSchema = {
 /* ------------------------------------------------------------------ */
 
 const server = new McpServer(
-  { name: "is.team", version: "1.7.0" },
+  { name: "is.team", version: "1.8.0" },
   {
     capabilities: {
       tools: {},
@@ -565,6 +565,174 @@ server.registerTool("chat_history", {
   const result = await client.chatHistory(args.cardId, args.limit);
   return { content: [{ type: "text" as const, text: result }] };
 });
+
+/* ================================================================== */
+/*  Workspace-scoped Integration Tools                                 */
+/* ================================================================== */
+
+const WorkspaceIdArg = { workspaceId: z.string().describe("Workspace ID") };
+
+/** Helper for integration tools — all route through executeIntegrationTool. */
+function registerIntegrationTool(
+  name: string,
+  title: string,
+  description: string,
+  extraSchema: Record<string, z.ZodTypeAny>,
+  readOnly: boolean,
+) {
+  server.registerTool(name, {
+    title,
+    description,
+    inputSchema: { ...WorkspaceIdArg, ...extraSchema },
+    annotations: { readOnlyHint: readOnly, destructiveHint: false, openWorldHint: true },
+  }, async (args) => {
+    const { workspaceId, ...rest } = args;
+    const result = await client.executeIntegrationTool(name, workspaceId, rest);
+    return { content: [{ type: "text" as const, text: result }] };
+  });
+}
+
+/* ── Meta ──────────────────────────────────────────────────────────── */
+registerIntegrationTool("list_integrations", "List Integrations",
+  "List all connected integrations (GitHub, Slack, Drive, Figma) for a workspace.", {}, true);
+
+/* ── GitHub ─────────────────────────────────────────────────────────── */
+registerIntegrationTool("github_list_repos", "GitHub: List Repos",
+  "List repositories connected to the workspace.", {}, true);
+registerIntegrationTool("github_search_issues", "GitHub: Search Issues",
+  "Search issues in a repository.", {
+    repo: z.string().describe("Repository full name (e.g. owner/repo)"),
+    query: z.string().optional().describe("Search query"),
+    state: z.enum(["open", "closed"]).optional().describe("Issue state filter"),
+  }, true);
+registerIntegrationTool("github_search_prs", "GitHub: Search PRs",
+  "Search pull requests in a repository.", {
+    repo: z.string().describe("Repository full name"),
+    query: z.string().optional().describe("Search query"),
+    state: z.enum(["open", "closed"]).optional().describe("PR state filter"),
+  }, true);
+registerIntegrationTool("github_create_issue", "GitHub: Create Issue",
+  "Create a new issue in a repository.", {
+    repo: z.string().describe("Repository full name"),
+    title: z.string().describe("Issue title"),
+    body: z.string().optional().describe("Issue body (markdown)"),
+    labels: z.array(z.string()).optional().describe("Label names"),
+    assignees: z.array(z.string()).optional().describe("GitHub usernames to assign"),
+  }, false);
+registerIntegrationTool("github_create_pr", "GitHub: Create PR",
+  "Create a pull request.", {
+    repo: z.string().describe("Repository full name"),
+    title: z.string().describe("PR title"),
+    head: z.string().describe("Source branch"),
+    base: z.string().describe("Target branch"),
+    body: z.string().optional().describe("PR description"),
+    draft: z.boolean().optional().describe("Create as draft PR"),
+  }, false);
+registerIntegrationTool("github_get_file", "GitHub: Get File",
+  "Get file contents from a repository.", {
+    repo: z.string().describe("Repository full name"),
+    path: z.string().describe("File path (e.g. src/index.ts)"),
+    ref: z.string().optional().describe("Branch or commit SHA"),
+  }, true);
+registerIntegrationTool("github_create_branch", "GitHub: Create Branch",
+  "Create a new branch from an existing ref.", {
+    repo: z.string().describe("Repository full name"),
+    branch: z.string().describe("New branch name"),
+    fromRef: z.string().optional().describe("Source branch (default: main)"),
+  }, false);
+
+/* ── Google Drive ───────────────────────────────────────────────────── */
+registerIntegrationTool("drive_search_files", "Drive: Search Files",
+  "Search files in the connected Google Drive.", {
+    query: z.string().optional().describe("Search query (file name)"),
+  }, true);
+registerIntegrationTool("drive_get_file", "Drive: Get File",
+  "Get file metadata and embed URL.", {
+    fileId: z.string().describe("Google Drive file ID"),
+  }, true);
+registerIntegrationTool("drive_create_doc", "Drive: Create Document",
+  "Create a new Google Docs document.", {
+    title: z.string().describe("Document title"),
+    content: z.string().optional().describe("Initial text content"),
+  }, false);
+registerIntegrationTool("drive_create_sheet", "Drive: Create Spreadsheet",
+  "Create a new Google Sheets spreadsheet.", {
+    title: z.string().describe("Spreadsheet title"),
+  }, false);
+registerIntegrationTool("drive_create_folder", "Drive: Create Folder",
+  "Create a folder in Google Drive.", {
+    name: z.string().describe("Folder name"),
+    parentId: z.string().optional().describe("Parent folder ID"),
+  }, false);
+
+/* ── Slack ───────────────────────────────────────────────────────────── */
+registerIntegrationTool("slack_list_channels", "Slack: List Channels",
+  "List available Slack channels.", {}, true);
+registerIntegrationTool("slack_send_message", "Slack: Send Message",
+  "Send a message to a Slack channel. Omit channel to use the default.", {
+    channel: z.string().optional().describe("Channel ID (uses default if omitted)"),
+    text: z.string().describe("Message text"),
+  }, false);
+registerIntegrationTool("slack_send_thread_reply", "Slack: Reply in Thread",
+  "Reply to a message thread in Slack.", {
+    channel: z.string().describe("Channel ID"),
+    threadTs: z.string().describe("Thread timestamp (ts) of the parent message"),
+    text: z.string().describe("Reply text"),
+  }, false);
+registerIntegrationTool("slack_get_channel_history", "Slack: Channel History",
+  "Read recent messages from a Slack channel.", {
+    channel: z.string().describe("Channel ID"),
+    limit: zNumOptional("Number of messages (default 20, max 100)"),
+  }, true);
+
+/* ── Figma ───────────────────────────────────────────────────────────── */
+registerIntegrationTool("figma_get_file", "Figma: Get File",
+  "Get Figma file metadata (name, thumbnail, pages).", {
+    fileKeyOrUrl: z.string().describe("Figma file key or full URL"),
+  }, true);
+registerIntegrationTool("figma_get_comments", "Figma: Get Comments",
+  "Get comments on a Figma file.", {
+    fileKey: z.string().describe("Figma file key"),
+  }, true);
+registerIntegrationTool("figma_post_comment", "Figma: Post Comment",
+  "Post a comment on a Figma file.", {
+    fileKey: z.string().describe("Figma file key"),
+    message: z.string().describe("Comment text"),
+  }, false);
+
+/* ── Google Calendar ─────────────────────────────────────────────────── */
+registerIntegrationTool("calendar_list_events", "Calendar: List Events",
+  "List upcoming calendar events (defaults to next 7 days).", {
+    timeMin: z.string().optional().describe("Start time (ISO, default: now)"),
+    timeMax: z.string().optional().describe("End time (ISO, default: +7 days)"),
+    maxResults: zNumOptional("Max events to return (default 20)"),
+  }, true);
+registerIntegrationTool("calendar_get_event", "Calendar: Get Event",
+  "Get details of a specific calendar event.", {
+    eventId: z.string().describe("Calendar event ID"),
+  }, true);
+registerIntegrationTool("calendar_create_event", "Calendar: Create Event",
+  "Create a new calendar event.", {
+    summary: z.string().describe("Event title"),
+    start: z.string().describe("Start time (ISO)"),
+    end: z.string().describe("End time (ISO)"),
+    description: z.string().optional().describe("Event description"),
+    attendees: z.array(z.string()).optional().describe("Attendee email addresses"),
+    timeZone: z.string().optional().describe("Time zone (default: UTC)"),
+  }, false);
+registerIntegrationTool("calendar_update_event", "Calendar: Update Event",
+  "Update an existing calendar event.", {
+    eventId: z.string().describe("Calendar event ID"),
+    summary: z.string().optional().describe("New title"),
+    start: z.string().optional().describe("New start time (ISO)"),
+    end: z.string().optional().describe("New end time (ISO)"),
+    description: z.string().optional().describe("New description"),
+    timeZone: z.string().optional().describe("Time zone (default: UTC)"),
+  }, false);
+registerIntegrationTool("calendar_delete_event", "Calendar: Delete Event",
+  "Delete a calendar event.", {
+    eventId: z.string().describe("Calendar event ID"),
+  }, false);
 
 /* ------------------------------------------------------------------ */
 /*  Shared subscribe / unsubscribe logic                               */
