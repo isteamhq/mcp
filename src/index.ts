@@ -628,6 +628,22 @@ registerIntegrationTool("github_create_pr", "GitHub: Create PR",
     body: z.string().optional().describe("PR description"),
     draft: z.boolean().optional().describe("Create as draft PR"),
   }, false);
+registerIntegrationTool("github_create_repo", "GitHub: Create Repo",
+  "Create a new GitHub repository.", {
+    name: z.string().describe("Repository name"),
+    description: z.string().optional().describe("Repository description"),
+    private: z.boolean().optional().describe("Private repo (default: true)"),
+    org: z.string().optional().describe("Organization name (omit for personal repo)"),
+  }, false);
+registerIntegrationTool("github_update_repo", "GitHub: Update Repo",
+  "Update repository settings (name, description, visibility).", {
+    repo: z.string().describe("Repository full name (e.g. owner/repo)"),
+    name: z.string().optional().describe("New repository name"),
+    description: z.string().optional().describe("New description"),
+    private: z.boolean().optional().describe("Set private/public"),
+    homepage: z.string().optional().describe("Homepage URL"),
+    archived: z.boolean().optional().describe("Archive/unarchive"),
+  }, false);
 registerIntegrationTool("github_get_file", "GitHub: Get File",
   "Get file contents from a repository.", {
     repo: z.string().describe("Repository full name"),
