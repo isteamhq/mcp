@@ -644,6 +644,23 @@ registerIntegrationTool("github_update_repo", "GitHub: Update Repo",
     homepage: z.string().optional().describe("Homepage URL"),
     archived: z.boolean().optional().describe("Archive/unarchive"),
   }, false);
+registerIntegrationTool("github_merge_pr", "GitHub: Merge PR",
+  "Merge a pull request.", {
+    repo: z.string().describe("Repository full name"),
+    pullNumber: zNum("Pull request number"),
+    mergeMethod: z.enum(["merge", "squash", "rebase"]).optional().describe("Merge method (default: merge)"),
+    commitTitle: z.string().optional().describe("Custom commit title for squash/merge"),
+  }, false);
+registerIntegrationTool("github_close_pr", "GitHub: Close PR",
+  "Close a pull request without merging.", {
+    repo: z.string().describe("Repository full name"),
+    pullNumber: zNum("Pull request number"),
+  }, false);
+registerIntegrationTool("github_close_issue", "GitHub: Close Issue",
+  "Close a GitHub issue.", {
+    repo: z.string().describe("Repository full name"),
+    issueNumber: zNum("Issue number"),
+  }, false);
 registerIntegrationTool("github_get_file", "GitHub: Get File",
   "Get file contents from a repository.", {
     repo: z.string().describe("Repository full name"),
