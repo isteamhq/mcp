@@ -680,6 +680,21 @@ registerIntegrationTool("drive_create_folder", "Drive: Create Folder",
     name: z.string().describe("Folder name"),
     parentId: z.string().optional().describe("Parent folder ID"),
   }, false);
+registerIntegrationTool("drive_delete_file", "Drive: Delete File",
+  "Delete a file or folder from Google Drive.", {
+    fileId: z.string().describe("Google Drive file or folder ID"),
+  }, false);
+registerIntegrationTool("drive_update_file", "Drive: Update File",
+  "Rename a file or update its description.", {
+    fileId: z.string().describe("Google Drive file ID"),
+    name: z.string().optional().describe("New file name"),
+    description: z.string().optional().describe("New description"),
+  }, false);
+registerIntegrationTool("drive_move_file", "Drive: Move File",
+  "Move a file to a different folder.", {
+    fileId: z.string().describe("Google Drive file ID"),
+    targetFolderId: z.string().describe("Destination folder ID"),
+  }, false);
 
 /* ── Slack ───────────────────────────────────────────────────────────── */
 registerIntegrationTool("slack_list_channels", "Slack: List Channels",
