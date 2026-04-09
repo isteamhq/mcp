@@ -1,12 +1,12 @@
 {
   "name": "@isteam/mcp",
-  "version": "1.7.2",
+  "version": "1.7.3",
   "description": "MCP server for is.team — manage tasks, get real-time notifications, and automate workflows via AI agents",
   "type": "module",
   "main": "./dist/index.js",
   "bin": {
-    "mcp": "./bin/is-team-mcp.mjs",
-    "isteam-mcp": "./bin/is-team-mcp.mjs",
+    "mcp": "./bin/mcp.mjs",
+    "isteam-mcp": "./bin/isteam-mcp.mjs",
     "is-team-mcp": "./bin/is-team-mcp.mjs",
     "is-team-mcp-setup": "./bin/is-team-mcp-setup.mjs"
   },
