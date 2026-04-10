@@ -965,15 +965,16 @@ async function performSubscribe(cardId: string, workspaceId: string, boardId: st
 
   // Update agent session status — must await to ensure badge appears on card
   try {
-    if (!fromUI) {
-      await updateSessionStatus(workspaceId, "subscribed", { cardId, boardId, nodeId });
-      process.stderr.write(`[mcp] Agent session updated: subscribed to ${cardId}\n`);
-    } else {
-      const db2 = getRtdb();
-      await rtdbUpdate(rtdbRef(db2, `${AGENT_SESSION_ROOT}/${workspaceId}/${SESSION_ID}`), { status: "subscribed", lastHeartbeat: Date.now() });
-    }
+    await ensureFirebaseAuth();
+    const rtdb2 = getRtdb();
+    const sessionPath = `${AGENT_SESSION_ROOT}/${workspaceId}/${SESSION_ID}`;
+    const updateData = fromUI
+      ? { status: "subscribed" as const, lastHeartbeat: Date.now() }
+      : { status: "subscribed" as const, assignedCard: { cardId, boardId, nodeId }, lastHeartbeat: Date.now() };
+    await rtdbUpdate(rtdbRef(rtdb2, sessionPath), updateData);
+    process.stderr.write(`[mcp] Agent session updated: subscribed to ${cardId} (path: ${sessionPath})\n`);
   } catch (e) {
-    process.stderr.write(`[mcp] Failed to update session status: ${String(e)}\n`);
+    process.stderr.write(`[mcp] Failed to update session status: ${e instanceof Error ? e.stack ?? e.message : String(e)}\n`);
   }
 
   return `Subscribed to card ${cardId}. You will be notified when new tasks appear and chat messages will be forwarded to you.`;
@@ -996,11 +997,14 @@ async function performUnsubscribe(cardId: string, fromUI = false): Promise<strin
   // Update agent session — must await to ensure badge is removed from card
   try {
     if (!fromUI) {
-      await updateSessionStatus(sub.workspaceId, "idle", null);
+      await ensureFirebaseAuth();
+      const rtdb2 = getRtdb();
+      const sessionPath = `${AGENT_SESSION_ROOT}/${sub.workspaceId}/${SESSION_ID}`;
+      await rtdbUpdate(rtdbRef(rtdb2, sessionPath), { status: "idle", assignedCard: null, lastHeartbeat: Date.now() });
       process.stderr.write(`[mcp] Agent session updated: idle (unsubscribed from ${cardId})\n`);
     }
   } catch (e) {
-    process.stderr.write(`[mcp] Failed to update session status: ${String(e)}\n`);
+    process.stderr.write(`[mcp] Failed to update session status: ${e instanceof Error ? e.stack ?? e.message : String(e)}\n`);
   }
 
   return `Unsubscribed from card ${cardId}.`;
