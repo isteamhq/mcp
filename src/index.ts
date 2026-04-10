@@ -124,6 +124,7 @@ function getAuthUid(): string | null {
 const PRESENCE_HEARTBEAT_MS = 30_000; // re-write presence every 30s
 
 async function writePresence(workspaceId: string, nodeId: string): Promise<void> {
+  await ensureFirebaseAuth();
   const uid = getAuthUid();
   if (!uid) return;
   const db = getRtdb();
@@ -222,6 +223,7 @@ async function writeAgentSession(workspaceId: string): Promise<void> {
 }
 
 async function updateSessionHeartbeat(workspaceId: string): Promise<void> {
+  await ensureFirebaseAuth(); // Refresh token if expired (tokens last ~1 hour)
   const db = getRtdb();
   const sessionRef = rtdbRef(db, `${AGENT_SESSION_ROOT}/${workspaceId}/${SESSION_ID}`);
   await rtdbUpdate(sessionRef, { lastHeartbeat: Date.now() });
