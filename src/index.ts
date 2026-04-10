@@ -963,18 +963,17 @@ async function performSubscribe(cardId: string, workspaceId: string, boardId: st
 
   subscriptions.set(cardId, { cardId, workspaceId, boardId, nodeId, unsubscribe, chatUnsubscribe, taskIds, presenceInterval });
 
-  // Update agent session status
-  if (!fromUI) {
-    // Tool-based subscribe: update session with card info
-    updateSessionStatus(workspaceId, "subscribed", { cardId, boardId, nodeId }).catch((e) =>
-      process.stderr.write(`[mcp] Failed to update session status: ${String(e)}\n`),
-    );
-  } else {
-    // UI-driven: just set status to subscribed (assignedCard is already set by UI)
-    const db2 = getRtdb();
-    rtdbUpdate(rtdbRef(db2, `${AGENT_SESSION_ROOT}/${workspaceId}/${SESSION_ID}`), { status: "subscribed", lastHeartbeat: Date.now() }).catch((e) =>
-      process.stderr.write(`[mcp] Failed to update session status: ${String(e)}\n`),
-    );
+  // Update agent session status — must await to ensure badge appears on card
+  try {
+    if (!fromUI) {
+      await updateSessionStatus(workspaceId, "subscribed", { cardId, boardId, nodeId });
+      process.stderr.write(`[mcp] Agent session updated: subscribed to ${cardId}\n`);
+    } else {
+      const db2 = getRtdb();
+      await rtdbUpdate(rtdbRef(db2, `${AGENT_SESSION_ROOT}/${workspaceId}/${SESSION_ID}`), { status: "subscribed", lastHeartbeat: Date.now() });
+    }
+  } catch (e) {
+    process.stderr.write(`[mcp] Failed to update session status: ${String(e)}\n`);
   }
 
   return `Subscribed to card ${cardId}. You will be notified when new tasks appear and chat messages will be forwarded to you.`;
@@ -994,11 +993,14 @@ async function performUnsubscribe(cardId: string, fromUI = false): Promise<strin
   await clearAiPresence(sub.workspaceId, sub.nodeId);
   subscriptions.delete(cardId);
 
-  // Update agent session
-  if (!fromUI) {
-    updateSessionStatus(sub.workspaceId, "idle", null).catch((e) =>
-      process.stderr.write(`[mcp] Failed to update session status: ${String(e)}\n`),
-    );
+  // Update agent session — must await to ensure badge is removed from card
+  try {
+    if (!fromUI) {
+      await updateSessionStatus(sub.workspaceId, "idle", null);
+      process.stderr.write(`[mcp] Agent session updated: idle (unsubscribed from ${cardId})\n`);
+    }
+  } catch (e) {
+    process.stderr.write(`[mcp] Failed to update session status: ${String(e)}\n`);
   }
 
   return `Unsubscribed from card ${cardId}.`;
