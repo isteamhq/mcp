@@ -337,7 +337,7 @@ const CardIdArg = { cardId: z.string().describe("Board card ID (e.g. col-1773256
 const toNum = (v: unknown) => (typeof v === "string" ? Number(v) : v);
 const toNumOrNull = (v: unknown) => (v === null ? null : toNum(v));
 const zNum = (desc: string) => z.preprocess(toNum, z.number()).describe(desc);
-const zNumOptional = (desc: string) => z.preprocess(toNum, z.number()).optional().describe(desc);
+const zNumOptional = (desc: string) => z.number().optional().describe(desc);
 const zNumNullableOptional = (desc: string) => z.preprocess(toNumOrNull, z.number().nullable()).optional().describe(desc);
 
 const CreateTaskSchema = {
@@ -560,7 +560,7 @@ server.registerTool("chat_history", {
   description: "Read recent chat messages from a card's AI chat. Useful for understanding context before responding to a chat message.",
   inputSchema: {
     ...CardIdArg,
-    limit: z.preprocess(toNum, z.number()).optional().describe("Number of messages to retrieve (default 30, max 100)"),
+    limit: z.number().optional().describe("Number of messages to retrieve (default 30, max 100)"),
   },
   annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
 }, async (args) => {
@@ -1029,6 +1029,61 @@ async function performUnsubscribe(cardId: string, fromUI = false): Promise<strin
 
   return `Unsubscribed from card ${cardId}.`;
 }
+
+/* ── create_note ────────────────────────────────────────────────── */
+server.registerTool("create_note", {
+  title: "Create Note",
+  description: "Create a new note on the canvas board. Supports markdown content. Use nearNodeId to place it next to a card and auto-connect with an edge.",
+  inputSchema: {
+    workspaceId: z.string().describe("Workspace ID"),
+    boardId:     z.string().describe("Board ID"),
+    title:       z.string().optional().describe("Note title"),
+    content:     z.string().optional().describe("Note content (markdown supported: headings, lists, bold, links, checkboxes)"),
+    color:       z.number().optional().describe("Color 0-5: 0=Yellow, 1=Mint, 2=Pink, 3=Lavender, 4=Sky, 5=Peach"),
+    nearNodeId:  z.string().optional().describe("Place note next to this node and auto-connect with an edge"),
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+}, async (args) => {
+  const { workspaceId, ...rest } = args;
+  const result = await client.executeIntegrationTool("create_note", workspaceId, rest);
+  return { content: [{ type: "text" as const, text: result }] };
+});
+
+/* ── update_note ────────────────────────────────────────────────── */
+server.registerTool("update_note", {
+  title: "Update Note",
+  description: "Update an existing note's title, content, or color.",
+  inputSchema: {
+    workspaceId: z.string().describe("Workspace ID"),
+    boardId:     z.string().describe("Board ID"),
+    noteId:      z.string().describe("Note ID (e.g. note-1712345678)"),
+    title:       z.string().optional().describe("New title"),
+    content:     z.string().optional().describe("New content (markdown supported)"),
+    color:       z.number().optional().describe("New color 0-5"),
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+}, async (args) => {
+  const { workspaceId, ...rest } = args;
+  const result = await client.executeIntegrationTool("update_note", workspaceId, rest);
+  return { content: [{ type: "text" as const, text: result }] };
+});
+
+/* ── create_edge ────────────────────────────────────────────────── */
+server.registerTool("create_edge", {
+  title: "Create Edge",
+  description: "Connect two canvas nodes (cards or notes) with a directional edge.",
+  inputSchema: {
+    workspaceId:  z.string().describe("Workspace ID"),
+    boardId:      z.string().describe("Board ID"),
+    sourceNodeId: z.string().describe("Source node ID"),
+    targetNodeId: z.string().describe("Target node ID"),
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+}, async (args) => {
+  const { workspaceId, ...rest } = args;
+  const result = await client.executeIntegrationTool("create_edge", workspaceId, rest);
+  return { content: [{ type: "text" as const, text: result }] };
+});
 
 /* ── subscribe_card ─────────────────────────────────────────────── */
 server.registerTool("subscribe_card", {
