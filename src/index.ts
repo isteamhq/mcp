@@ -942,11 +942,17 @@ async function performSubscribe(cardId: string, workspaceId: string, boardId: st
     // Parse attachments if present
     const attachments = d.attachments as Array<{ name?: string; mimeType?: string; url?: string; size?: number }> | undefined;
     const attachmentLines: string[] = [];
+    const hasImages = attachments && Array.isArray(attachments) && attachments.some((a) => a.mimeType?.startsWith("image/"));
     if (attachments && Array.isArray(attachments) && attachments.length > 0) {
       attachmentLines.push(`Attachments:`);
       for (const a of attachments) {
         const sizeStr = (a.size ?? 0) < 1024 * 1024 ? `${((a.size ?? 0) / 1024).toFixed(0)} KB` : `${((a.size ?? 0) / (1024 * 1024)).toFixed(1)} MB`;
         attachmentLines.push(`- ${a.name ?? "file"} (${a.mimeType ?? "unknown"}, ${sizeStr}) ${a.url ?? ""}`);
+      }
+      if (hasImages) {
+        attachmentLines.push("");
+        attachmentLines.push("IMPORTANT: To view images, download them with curl and read with the Read tool:");
+        attachmentLines.push('curl -sL "URL" -o /tmp/chat-image.png && then use Read tool on /tmp/chat-image.png');
       }
     }
 
