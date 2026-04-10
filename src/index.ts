@@ -937,12 +937,24 @@ async function performSubscribe(cardId: string, workspaceId: string, boardId: st
     if (role !== "user" || timestamp <= lastProcessedChatTs) return;
     lastProcessedChatTs = timestamp;
 
-    process.stderr.write(`[mcp] Chat message from ${senderName} on ${cardId}: ${content.slice(0, 80)}...\n`);
+    // Parse attachments if present
+    const attachments = d.attachments as Array<{ name?: string; mimeType?: string; url?: string; size?: number }> | undefined;
+    const attachmentLines: string[] = [];
+    if (attachments && Array.isArray(attachments) && attachments.length > 0) {
+      attachmentLines.push(`Attachments:`);
+      for (const a of attachments) {
+        const sizeStr = (a.size ?? 0) < 1024 * 1024 ? `${((a.size ?? 0) / 1024).toFixed(0)} KB` : `${((a.size ?? 0) / (1024 * 1024)).toFixed(1)} MB`;
+        attachmentLines.push(`- ${a.name ?? "file"} (${a.mimeType ?? "unknown"}, ${sizeStr}) ${a.url ?? ""}`);
+      }
+    }
+
+    process.stderr.write(`[mcp] Chat message from ${senderName} on ${cardId}: ${content.slice(0, 80)}${attachmentLines.length > 0 ? ` [+${attachments!.length} files]` : ""}...\n`);
 
     const msg = [
       `<channel source="is-team" cardId="${cardId}" type="chat_message">`,
       `Chat message on card "${cardId}":`,
       `[${senderName}]: ${content}`,
+      ...(attachmentLines.length > 0 ? ["", ...attachmentLines] : []),
       ``,
       `Use chat_history for context if needed, then chat_respond to reply.`,
       `</channel>`,
