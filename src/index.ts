@@ -1071,17 +1071,53 @@ server.registerTool("update_note", {
 /* ── create_edge ────────────────────────────────────────────────── */
 server.registerTool("create_edge", {
   title: "Create Edge",
-  description: "Connect two canvas nodes (cards or notes) with a directional edge.",
+  description: "Connect two canvas nodes (cards or notes) with a directional edge. Optionally specify which side of each node the edge connects to.",
   inputSchema: {
     workspaceId:  z.string().describe("Workspace ID"),
     boardId:      z.string().describe("Board ID"),
     sourceNodeId: z.string().describe("Source node ID"),
     targetNodeId: z.string().describe("Target node ID"),
+    sourceHandle: z.enum(["top", "right", "bottom", "left"]).optional().describe("Side of source node to connect from (default: auto)"),
+    targetHandle: z.enum(["top", "right", "bottom", "left"]).optional().describe("Side of target node to connect to (default: auto)"),
   },
   annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
 }, async (args) => {
   const { workspaceId, ...rest } = args;
   const result = await client.executeIntegrationTool("create_edge", workspaceId, rest);
+  return { content: [{ type: "text" as const, text: result }] };
+});
+
+/* ── move_node ──────────────────────────────────────────────────── */
+server.registerTool("move_node", {
+  title: "Move Node",
+  description: "Move a canvas node (card or note) to a new position. Use read_card to see current node IDs.",
+  inputSchema: {
+    workspaceId: z.string().describe("Workspace ID"),
+    boardId:     z.string().describe("Board ID"),
+    nodeId:      z.string().describe("Node ID to move (e.g. col-123 or note-123)"),
+    x:           z.number().describe("New X coordinate"),
+    y:           z.number().describe("New Y coordinate"),
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+}, async (args) => {
+  const { workspaceId, ...rest } = args;
+  const result = await client.executeIntegrationTool("move_node", workspaceId, rest);
+  return { content: [{ type: "text" as const, text: result }] };
+});
+
+/* ── delete_edge ────────────────────────────────────────────────── */
+server.registerTool("delete_edge", {
+  title: "Delete Edge",
+  description: "Remove a connection (edge) between two canvas nodes.",
+  inputSchema: {
+    workspaceId: z.string().describe("Workspace ID"),
+    boardId:     z.string().describe("Board ID"),
+    edgeId:      z.string().describe("Edge ID to delete"),
+  },
+  annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+}, async (args) => {
+  const { workspaceId, ...rest } = args;
+  const result = await client.executeIntegrationTool("delete_edge", workspaceId, rest);
   return { content: [{ type: "text" as const, text: result }] };
 });
 
