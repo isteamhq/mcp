@@ -226,7 +226,19 @@ async function updateSessionHeartbeat(workspaceId: string): Promise<void> {
   await ensureFirebaseAuth(); // Refresh token if expired (tokens last ~1 hour)
   const db = getRtdb();
   const sessionRef = rtdbRef(db, `${AGENT_SESSION_ROOT}/${workspaceId}/${SESSION_ID}`);
+
+  // Check if session was deleted (e.g. stale onDisconnect fired after token refresh)
+  const snap = await rtdbGet(sessionRef);
+  if (!snap.exists() || !snap.val()?.agentId) {
+    process.stderr.write(`[mcp] Session lost for ${workspaceId}, re-registering...\n`);
+    await writeAgentSession(workspaceId);
+    return;
+  }
+
   await rtdbUpdate(sessionRef, { lastHeartbeat: Date.now() });
+  // Re-register onDisconnect — token refresh reconnects the WebSocket,
+  // which fires the old onDisconnect handler and removes the session.
+  await onDisconnect(sessionRef).remove();
 }
 
 async function updateSessionStatus(workspaceId: string, status: "idle" | "subscribed", assignedCard: { cardId: string; boardId: string; nodeId: string } | null): Promise<void> {
