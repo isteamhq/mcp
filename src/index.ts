@@ -580,6 +580,27 @@ server.registerTool("chat_history", {
   return { content: [{ type: "text" as const, text: result }] };
 });
 
+/* ── ask_chat ──────────────────────────────────────────────────── */
+server.registerTool("ask_chat", {
+  title: "Ask in Chat",
+  description: [
+    "Ask a question in the card's AI chat and wait for the user's answer.",
+    "Use this instead of asking in the terminal — the user may only be monitoring the card chat.",
+    "Three question types: 'text' (free input), 'options' (clickable choices), 'confirm' (approve/deny).",
+    "The user's response will arrive as a channel notification from the chat listener.",
+  ].join(" "),
+  inputSchema: {
+    ...CardIdArg,
+    question: z.string().describe("The question to ask the user"),
+    type:     z.enum(["text", "options", "confirm"]).describe("Question type: text (free input), options (pick one), confirm (yes/no)"),
+    options:  z.array(z.string()).optional().describe("Choices for 'options' type (ignored for other types)"),
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+}, async (args) => {
+  const result = await client.askChat(args.cardId, args.question, args.type, args.options);
+  return { content: [{ type: "text" as const, text: result }] };
+});
+
 /* ================================================================== */
 /*  Workspace-scoped Integration Tools                                 */
 /* ================================================================== */
@@ -1009,7 +1030,13 @@ async function performSubscribe(cardId: string, workspaceId: string, boardId: st
     process.stderr.write(`[mcp] Failed to update session status: ${e instanceof Error ? e.stack ?? e.message : String(e)}\n`);
   }
 
-  return `Subscribed to card ${cardId}. You will be notified when new tasks appear and chat messages will be forwarded to you.`;
+  return [
+    `Subscribed to card ${cardId}. You will be notified when new tasks appear and chat messages will be forwarded to you.`,
+    ``,
+    `IMPORTANT: When you need to ask the user a question, get approval, or offer choices, use the ask_chat tool instead of asking in the terminal.`,
+    `The user may only be monitoring the card chat — terminal questions will go unseen.`,
+    `Use ask_chat with type "text" for open questions, "options" for multiple choice, or "confirm" for yes/no approval.`,
+  ].join("\n");
 }
 
 /**

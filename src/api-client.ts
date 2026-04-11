@@ -68,6 +68,10 @@ export class IsTeamClient {
     return this.executeTool("chat_history", cardId, { limit: limit ?? 30 });
   }
 
+  async askChat(cardId: string, question: string, type: string, options?: string[]): Promise<string> {
+    return this.executeTool("ask_chat", cardId, { question, type, ...(options?.length ? { options } : {}) });
+  }
+
   /* ── Workspace-scoped integration tools ────────────────────────── */
 
   async executeIntegrationTool(tool: string, workspaceId: string, args?: Record<string, unknown>): Promise<string> {
