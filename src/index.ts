@@ -1121,6 +1121,56 @@ server.registerTool("delete_edge", {
   return { content: [{ type: "text" as const, text: result }] };
 });
 
+/* ── create_stack ──────────────────────────────────────────────── */
+server.registerTool("create_stack", {
+  title: "Create Stack",
+  description: "Group multiple notes into a stack. Notes are visually collapsed into a single stack node on the canvas. Their edges are removed. Minimum 2 notes required.",
+  inputSchema: {
+    workspaceId: z.string().describe("Workspace ID"),
+    boardId:     z.string().describe("Board ID"),
+    noteIds:     z.array(z.string()).describe("Array of note IDs to group into a stack (minimum 2)"),
+    title:       z.string().optional().describe("Stack title (auto-generated from first note if omitted)"),
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+}, async (args) => {
+  const { workspaceId, ...rest } = args;
+  const result = await client.executeIntegrationTool("create_stack", workspaceId, rest);
+  return { content: [{ type: "text" as const, text: result }] };
+});
+
+/* ── add_to_stack ──────────────────────────────────────────────── */
+server.registerTool("add_to_stack", {
+  title: "Add Notes to Stack",
+  description: "Add one or more notes to an existing stack. The notes will be hidden from the canvas and grouped under the stack.",
+  inputSchema: {
+    workspaceId: z.string().describe("Workspace ID"),
+    boardId:     z.string().describe("Board ID"),
+    stackId:     z.string().describe("Stack node ID (e.g. stack-1712345678)"),
+    noteIds:     z.array(z.string()).describe("Note IDs to add to the stack"),
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+}, async (args) => {
+  const { workspaceId, ...rest } = args;
+  const result = await client.executeIntegrationTool("add_to_stack", workspaceId, rest);
+  return { content: [{ type: "text" as const, text: result }] };
+});
+
+/* ── dissolve_stack ────────────────────────────────────────────── */
+server.registerTool("dissolve_stack", {
+  title: "Dissolve Stack",
+  description: "Dissolve a stack, restoring all notes as independent nodes on the canvas. The stack node is deleted.",
+  inputSchema: {
+    workspaceId: z.string().describe("Workspace ID"),
+    boardId:     z.string().describe("Board ID"),
+    stackId:     z.string().describe("Stack node ID to dissolve"),
+  },
+  annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+}, async (args) => {
+  const { workspaceId, ...rest } = args;
+  const result = await client.executeIntegrationTool("dissolve_stack", workspaceId, rest);
+  return { content: [{ type: "text" as const, text: result }] };
+});
+
 /* ── subscribe_card ─────────────────────────────────────────────── */
 server.registerTool("subscribe_card", {
   title: "Subscribe to Card",
