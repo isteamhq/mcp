@@ -215,12 +215,29 @@ async function main() {
 
   log("");
 
-  // Step 7: Launch Claude
+  // Step 7: Ask about autonomy mode
+  log(`${BOLD}Autonomy Mode${RESET}`);
+  log("When enabled, Claude will auto-approve all tool calls (file edits, bash commands, etc.).");
+  log("You can control the agent entirely from the card chat — no terminal interaction needed.");
+  log("");
+
+  const enableAutonomy = argYes || await confirm("Enable full autonomy mode? (recommended for MCP agents)");
+  log("");
+
+  // Step 8: Launch Claude
   log(`${BOLD}Starting Claude with MCP streaming...${RESET}`);
+  if (enableAutonomy) {
+    success("Autonomy mode enabled — all permissions auto-approved");
+  }
   log(`${DIM}Press Ctrl+C to stop${RESET}`);
   log("");
 
-  const claude = spawn("claude", ["--dangerously-load-development-channels", "server:is-team"], {
+  const claudeArgs = ["--dangerously-load-development-channels", "server:is-team"];
+  if (enableAutonomy) {
+    claudeArgs.push("--dangerously-skip-permissions");
+  }
+
+  const claude = spawn("claude", claudeArgs, {
     stdio: "inherit",
     cwd,
   });
