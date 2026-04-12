@@ -227,11 +227,22 @@ async function updateSessionHeartbeat(workspaceId: string): Promise<void> {
   const db = getRtdb();
   const sessionRef = rtdbRef(db, `${AGENT_SESSION_ROOT}/${workspaceId}/${SESSION_ID}`);
 
-  // Check if session was deleted (e.g. stale onDisconnect fired after token refresh)
+  // Check if session was deleted (e.g. stale onDisconnect fired after token refresh or sleep)
   const snap = await rtdbGet(sessionRef);
   if (!snap.exists() || !snap.val()?.agentId) {
     process.stderr.write(`[mcp] Session lost for ${workspaceId}, re-registering...\n`);
     await writeAgentSession(workspaceId);
+
+    // Restore subscription status if an active subscription exists for this workspace
+    const activeSub = [...subscriptions.values()].find((s) => s.workspaceId === workspaceId);
+    if (activeSub) {
+      process.stderr.write(`[mcp] Restoring subscription badge for card ${activeSub.cardId}\n`);
+      await updateSessionStatus(workspaceId, "subscribed", {
+        cardId: activeSub.cardId,
+        boardId: activeSub.boardId,
+        nodeId: activeSub.nodeId,
+      });
+    }
     return;
   }
 
