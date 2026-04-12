@@ -451,7 +451,7 @@ const UnsubscribeCardSchema = {
 /* ------------------------------------------------------------------ */
 
 const server = new McpServer(
-  { name: "is.team", version: "1.8.0" },
+  { name: "is.team", version: "1.9.0" },
   {
     capabilities: {
       tools: {},
