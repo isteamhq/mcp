@@ -23,6 +23,13 @@ export type PermissionMode = "acceptEdits" | "bypassPermissions" | "plan";
 export interface DaemonConfig {
   /** is.team API token (ist_…) */
   token: string;
+  /**
+   * User-chosen 5-char alphanumeric name for this agent (e.g. "HOME1",
+   * "MACM1", "DEV01"). Appears in the is.team dashboard as the agent's
+   * badge. Distinguishes this terminal/daemon from other agents run by
+   * the same user. Must match /^[A-Z0-9]{5}$/.
+   */
+  agentName: string;
   /** Card id the daemon listens to (col-…) */
   agentCardId: string;
   /** Workspace id */
@@ -41,6 +48,11 @@ export interface DaemonConfig {
   claudePath: string;
   /** Base URL (defaults to https://is.team) */
   baseUrl?: string;
+}
+
+/** Validation helper used by both setup wizard and runtime. */
+export function isValidAgentName(s: string): boolean {
+  return /^[A-Z0-9]{5}$/.test(s);
 }
 
 export function ensureIsteamDir(): void {

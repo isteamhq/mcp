@@ -15,7 +15,7 @@ import { join } from "path";
 import { execSync, spawn } from "child_process";
 import { homedir, platform } from "os";
 
-import { writeDaemonConfig, type PermissionMode } from "./daemon-config.js";
+import { writeDaemonConfig, isValidAgentName, type PermissionMode } from "./daemon-config.js";
 import { installService, currentPlatform } from "./service-installer.js";
 
 /* ------------------------------------------------------------------ */
@@ -82,6 +82,27 @@ function resolveClaudePath(): string {
     if (p) return p;
   } catch { /* ignore */ }
   return "claude";
+}
+
+/**
+ * Ask the user for a 5-char agent name. Loops until input validates.
+ * In --yes mode, synthesize a random one to keep non-interactive callers
+ * (CI, scripts) working without prompting.
+ */
+async function askAgentName(yesMode: boolean): Promise<string> {
+  if (yesMode) {
+    const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let id = "";
+    for (let i = 0; i < 5; i++) id += chars[Math.floor(Math.random() * chars.length)];
+    info(`--yes mode: auto-generated agent name ${id}`);
+    return id;
+  }
+  for (;;) {
+    const raw = await ask(`${BOLD}Agent name (5 chars):${RESET} `);
+    const norm = raw.trim().toUpperCase();
+    if (isValidAgentName(norm)) return norm;
+    warn("Must be exactly 5 alphanumeric characters (A-Z, 0-9). Try again.");
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -186,7 +207,17 @@ async function main() {
 
   log("");
 
-  // Step 5: Create/update .mcp.json
+  // Step 5: Ask for agent name (mandatory)
+  log(`${BOLD}Agent name${RESET}`);
+  log("Pick a 5-character label that identifies this terminal in the is.team dashboard.");
+  log(`Examples: ${DIM}HOME1, MACM1, DEV01, LAPTP, PROD1${RESET}. Uppercase letters and digits only.`);
+  log("Use a different name in each project/terminal so you can tell your agents apart.");
+  log("");
+
+  const agentName = await askAgentName(argYes);
+  log("");
+
+  // Step 6: Create/update .mcp.json
   log(`${BOLD}Configuring MCP...${RESET}`);
   const mcpConfigPath = join(cwd, ".mcp.json");
   let mcpConfig: Record<string, unknown> = {};
@@ -206,12 +237,13 @@ async function main() {
     args: ["-y", "@isteam/mcp"],
     env: {
       IST_API_TOKEN: token,
+      IST_AGENT_NAME: agentName,
     },
   };
   mcpConfig.mcpServers = servers;
 
   writeFileSync(mcpConfigPath, JSON.stringify(mcpConfig, null, 2) + "\n");
-  success(".mcp.json configured");
+  success(`.mcp.json configured (agent name: ${agentName})`);
 
   // Step 6: Update Claude settings for auto-accept
   const claudeSettingsDir = join(homedir(), ".claude");
@@ -254,7 +286,7 @@ async function main() {
     log("");
 
     if (wantsDaemon) {
-      await setupDaemon(token, cwd);
+      await setupDaemon(token, cwd, agentName);
       return;
     }
   } else if (!canDaemon) {
@@ -329,7 +361,7 @@ async function fetchCards(token: string): Promise<CardSummary[]> {
   }
 }
 
-async function setupDaemon(token: string, cwd: string): Promise<void> {
+async function setupDaemon(token: string, cwd: string, agentName: string): Promise<void> {
   log(`${BOLD}Daemon setup${RESET}`);
   log(`${DIM}${"─".repeat(40)}${RESET}`);
   log("");
@@ -383,6 +415,7 @@ async function setupDaemon(token: string, cwd: string): Promise<void> {
   const claudePath = resolveClaudePath();
   writeDaemonConfig({
     token,
+    agentName,
     agentCardId: chosen.cardId,
     workspaceId: chosen.workspaceId,
     boardId: chosen.boardId,
@@ -392,7 +425,7 @@ async function setupDaemon(token: string, cwd: string): Promise<void> {
     permissionMode,
     claudePath,
   });
-  success(`Config written to ~/.isteam/daemon.json`);
+  success(`Config written to ~/.isteam/daemon.json (agent name: ${agentName})`);
 
   // Install service
   log("");

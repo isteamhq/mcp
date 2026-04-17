@@ -62,15 +62,29 @@ const client = new IsTeamClient(BASE_URL, API_TOKEN);
 /*  Agent Session Identity                                             */
 /* ------------------------------------------------------------------ */
 
-/** Generate a random 4-char alphanumeric ID (uppercase). */
+/** Generate a random 5-char alphanumeric ID (uppercase) — fallback only. */
 function generateAgentId(): string {
   const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
   let id = "";
-  for (let i = 0; i < 4; i++) id += chars[Math.floor(Math.random() * chars.length)];
+  for (let i = 0; i < 5; i++) id += chars[Math.floor(Math.random() * chars.length)];
   return id;
 }
 
-const AGENT_ID    = generateAgentId();
+/**
+ * Prefer the user-provided agent name (set via setup wizard, stored in the
+ * project's .mcp.json env). Must be 5 alphanumeric characters — validated
+ * here so a malformed env value doesn't poison the UI badge.
+ */
+function resolveAgentId(): string {
+  const raw = process.env.IST_AGENT_NAME?.trim().toUpperCase();
+  if (raw && /^[A-Z0-9]{5}$/.test(raw)) return raw;
+  if (raw) {
+    process.stderr.write(`[mcp] IST_AGENT_NAME "${raw}" is invalid (must be 5 alphanumeric chars) — using random fallback.\n`);
+  }
+  return generateAgentId();
+}
+
+const AGENT_ID    = resolveAgentId();
 const SESSION_ID  = `ses-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 const AGENT_SESSION_ROOT = "agentSessions";
 
@@ -458,7 +472,7 @@ const UnsubscribeCardSchema = {
 /* ------------------------------------------------------------------ */
 
 const server = new McpServer(
-  { name: "is.team", version: "2.0.0" },
+  { name: "is.team", version: "2.1.0" },
   {
     capabilities: {
       tools: {},

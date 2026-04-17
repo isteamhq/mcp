@@ -31,6 +31,7 @@ import {
 import {
   readDaemonConfig,
   ensureIsteamDir,
+  isValidAgentName,
   DAEMON_LOG,
   DAEMON_ERROR_LOG,
   DAEMON_PID_FILE,
@@ -129,7 +130,14 @@ async function ensureAuth(): Promise<void> {
 /* ------------------------------------------------------------------ */
 
 const SESSION_ID = `daemon-${process.pid}-${Date.now()}`;
-const AGENT_ID   = "DMN" + Math.random().toString(36).slice(2, 4).toUpperCase();
+const AGENT_ID   = isValidAgentName(cfg.agentName)
+  ? cfg.agentName
+  : (() => {
+      // Old configs won't have agentName — synthesize a deterministic fallback
+      // from the card id so the badge stays stable across restarts.
+      const suffix = cfg.agentCardId.slice(-4).toUpperCase().padStart(4, "0");
+      return ("D" + suffix).slice(0, 5);
+    })();
 const SESSION_ROOT = "agentSessions";
 const PRESENCE_ROOT = "aiPresence";
 

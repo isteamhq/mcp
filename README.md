@@ -59,6 +59,12 @@ The AI agent will receive instant notifications and can start working immediatel
 
 Run Claude as a persistent background daemon that auto-executes any task assigned to a chosen card. The daemon survives terminal closure, restarts itself on crashes, and relays Claude's output back to the card chat so you can monitor progress entirely from is.team.
 
+### Agent name (v2.1+)
+
+Every setup run now asks for a **5-character agent name** (letters + digits). The name appears on the agent's badge in the is.team dashboard, so when you run multiple agents — one per project, one per machine, one foreground and one in background — you can tell them apart at a glance. Use different names for each terminal/project. Examples: `HOME1`, `MACM1`, `DEV01`, `LAPTP`, `PROD1`.
+
+The name is stored in the project's `.mcp.json` under the `IST_AGENT_NAME` env var (and in `~/.isteam/daemon.json` when running in daemon mode). If you ever need to change it, re-run setup or edit the file by hand.
+
 ### Setup
 
 ```bash
@@ -114,6 +120,7 @@ Before an AI agent can interact with a card:
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `IST_API_TOKEN` | Yes | Your is.team API token (`ist_xxx`) |
+| `IST_AGENT_NAME` | No | 5-char agent badge (A-Z, 0-9). Set by setup wizard. Falls back to a random 5-char id if missing or malformed. |
 | `IST_BASE_URL` | No | API base URL (default: `https://is.team`) |
 
 ## License
