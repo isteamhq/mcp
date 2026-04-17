@@ -25,6 +25,7 @@ import {
   update as rtdbUpdate,
   remove as rtdbRemove,
   onDisconnect,
+  onValue,
   get as rtdbGet,
 } from "firebase/database";
 
@@ -135,23 +136,44 @@ const AGENT_ID   = isValidAgentName(cfg.agentName)
   : (() => {
       // Old configs won't have agentName — synthesize a deterministic fallback
       // from the card id so the badge stays stable across restarts.
-      const suffix = cfg.agentCardId.slice(-4).toUpperCase().padStart(4, "0");
-      return ("D" + suffix).slice(0, 5);
+      const suffix = cfg.agentCardId.slice(-5).toUpperCase().padStart(5, "0");
+      return ("D" + suffix).slice(0, 6);
     })();
 const SESSION_ROOT = "agentSessions";
 const PRESENCE_ROOT = "aiPresence";
 
-async function writeSession(): Promise<void> {
+/**
+ * Shared state — `currentCard` is the card this daemon is actively watching
+ * (mirrored to RTDB as the session's `assignedCard`). `null` means the
+ * daemon is running but idle (visible in team-members panel, ready to be
+ * dragged onto a card from the UI). Mutated by attachCard/detachCard/goIdle.
+ */
+let currentCard: { cardId: string; boardId: string; nodeId: string } | null = null;
+
+/**
+ * One-time (at startup) + defensive (after token refresh that wiped our
+ * session): clear stale sessions for this uid and write the full session
+ * record reflecting `currentCard`. Does not touch the Firestore card
+ * listener — attachCard owns that.
+ */
+async function initSession(): Promise<void> {
   const uid = auth.currentUser?.uid;
   if (!uid) return;
 
-  // Remove any stale sessions for this uid
+  // Remove ONLY zombie sessions for this uid (no heartbeat in > 2 minutes).
+  // Never remove other live sessions — a user can legitimately run both a
+  // daemon and a stdio MCP (via Claude Code) at the same time, with
+  // different SESSION_IDs. If we blindly wiped peers, the two would
+  // ping-pong deleting each other every 30s.
+  const STALE_THRESHOLD = 2 * 60 * 1000;
   const wsRef = rtdbRef(rtdb, `${SESSION_ROOT}/${cfg.workspaceId}`);
   const snap = await rtdbGet(wsRef);
   if (snap.exists()) {
-    const sessions = snap.val() as Record<string, { uid?: string }>;
+    const sessions = snap.val() as Record<string, { uid?: string; lastHeartbeat?: number }>;
+    const now = Date.now();
     for (const [sid, data] of Object.entries(sessions)) {
-      if (data.uid === uid && sid !== SESSION_ID) {
+      const stale = now - (data.lastHeartbeat ?? 0) > STALE_THRESHOLD;
+      if (data.uid === uid && sid !== SESSION_ID && stale) {
         await rtdbRemove(rtdbRef(rtdb, `${SESSION_ROOT}/${cfg.workspaceId}/${sid}`));
       }
     }
@@ -162,16 +184,52 @@ async function writeSession(): Promise<void> {
     uid,
     agentId: AGENT_ID,
     mode: "daemon",
-    status: "subscribed",
-    assignedCard: { cardId: cfg.agentCardId, boardId: cfg.boardId, nodeId: cfg.nodeId },
+    status: currentCard ? "subscribed" : "idle",
+    assignedCard: currentCard,
     connectedAt: Date.now(),
     lastHeartbeat: Date.now(),
   });
   await onDisconnect(sessionRef).remove();
 
-  const presenceRef = rtdbRef(rtdb, `${PRESENCE_ROOT}/${cfg.workspaceId}/${cfg.nodeId}/${uid}`);
-  await rtdbSet(presenceRef, { active: true, subscribedAt: Date.now(), daemon: true });
-  await onDisconnect(presenceRef).remove();
+  if (currentCard) {
+    const presenceRef = rtdbRef(rtdb, `${PRESENCE_ROOT}/${cfg.workspaceId}/${currentCard.nodeId}/${uid}`);
+    await rtdbSet(presenceRef, { active: true, subscribedAt: Date.now(), daemon: true });
+    await onDisconnect(presenceRef).remove();
+  }
+}
+
+/**
+ * Periodic: only touch `lastHeartbeat`. Must NOT overwrite `assignedCard` or
+ * `status` — the UI flips those to reassign the daemon between cards or park
+ * it as idle. Re-writing the full session would fight the UI and make the
+ * badge flicker.
+ *
+ * Also re-registers onDisconnect handlers after token refresh (the WebSocket
+ * reconnect fires any stale onDisconnect and may remove the session).
+ */
+async function heartbeat(): Promise<void> {
+  const uid = auth.currentUser?.uid;
+  if (!uid) return;
+
+  const sessionRef = rtdbRef(rtdb, `${SESSION_ROOT}/${cfg.workspaceId}/${SESSION_ID}`);
+  const snap = await rtdbGet(sessionRef);
+
+  // Session was removed (stale onDisconnect after token refresh, network blip,
+  // etc.) — recreate it. initSession writes based on `currentCard` so the
+  // restored session reflects our real state (subscribed vs idle).
+  if (!snap.exists()) {
+    logInfo("session lost — re-initializing");
+    await initSession();
+    return;
+  }
+
+  await rtdbUpdate(sessionRef, { lastHeartbeat: Date.now() });
+  await onDisconnect(sessionRef).remove();
+
+  if (currentCard) {
+    const presenceRef = rtdbRef(rtdb, `${PRESENCE_ROOT}/${cfg.workspaceId}/${currentCard.nodeId}/${uid}`);
+    await onDisconnect(presenceRef).remove();
+  }
 }
 
 async function setStatus(status: "idle" | "working" | "subscribed"): Promise<void> {
@@ -179,11 +237,129 @@ async function setStatus(status: "idle" | "working" | "subscribed"): Promise<voi
   await rtdbUpdate(sessionRef, { status, lastHeartbeat: Date.now() }).catch(() => {});
 }
 
-setInterval(() => {
+let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+
+heartbeatInterval = setInterval(() => {
   ensureAuth()
-    .then(() => writeSession())
+    .then(() => heartbeat())
     .catch((e) => logError(`heartbeat failed: ${String(e)}`));
 }, 30_000);
+
+/**
+ * Listen to our own session. The UI can set `assignedCard: null` to detach
+ * the agent — when that happens we clean up and exit. launchd/systemd are
+ * configured to NOT restart on a clean exit (code 0), so this acts as the
+ * user-facing "stop the daemon from the web UI" control.
+ */
+let sessionWatchUnsub: Unsubscribe | null = null;
+let connectWatchUnsub: Unsubscribe | null = null;
+
+/**
+ * Firebase RTDB fires server-side `onDisconnect` handlers on every WebSocket
+ * drop — including the idle/keepalive reconnects that happen every few
+ * minutes. That wipes our session + presence, making the badge flicker until
+ * the next 30s heartbeat restores it. Hook `.info/connected` so we re-write
+ * state the instant the WS comes back up, syncing to whatever the UI set
+ * while we were offline (could be a different card, could be idle).
+ */
+function watchConnection(): void {
+  let connectedOnce = false;
+  connectWatchUnsub = onValue(rtdbRef(rtdb, ".info/connected"), (snap) => {
+    const connected = snap.val() === true;
+    if (!connected) return;
+    if (!connectedOnce) { connectedOnce = true; return; }
+    void (async () => {
+      try {
+        const sessionRef = rtdbRef(rtdb, `${SESSION_ROOT}/${cfg.workspaceId}/${SESSION_ID}`);
+        const cur = await rtdbGet(sessionRef);
+
+        // Our own server-side onDisconnect wiped the session. Recreate from
+        // `currentCard` (our authoritative local state).
+        if (!cur.exists()) {
+          logInfo("WS reconnected — session wiped, restoring from local state");
+          await initSession();
+          return;
+        }
+
+        // Session exists — the UI may have changed `assignedCard` while we
+        // were offline. Reconcile local state to whatever the UI set.
+        const val = cur.val() as { assignedCard?: { cardId: string; boardId: string; nodeId: string } | null };
+        const uiCard = val.assignedCard ?? null;
+
+        if (!uiCard && currentCard) {
+          logInfo("WS reconnected — UI parked us as idle during disconnect");
+          await goIdle();
+        } else if (uiCard && (!currentCard || currentCard.nodeId !== uiCard.nodeId)) {
+          logInfo(`WS reconnected — UI moved us to ${uiCard.cardId} during disconnect`);
+          await attachCard(uiCard);
+        } else {
+          // Local state matches UI — just refresh onDisconnect handlers.
+          await onDisconnect(sessionRef).remove();
+          const uid = auth.currentUser?.uid;
+          if (uid && currentCard) {
+            const presenceRef = rtdbRef(rtdb, `${PRESENCE_ROOT}/${cfg.workspaceId}/${currentCard.nodeId}/${uid}`);
+            await onDisconnect(presenceRef).remove();
+          }
+        }
+      } catch (e) {
+        logError(`reconnect handling failed: ${String(e)}`);
+      }
+    })();
+  });
+}
+
+/**
+ * Watch our own session for UI-driven card reassignment. The UI can:
+ *   - set `assignedCard: null` → park the daemon as idle (badge moves to
+ *     the team-members panel, daemon stays running, ready for reassignment)
+ *   - set `assignedCard` to a different card → daemon detaches from the old
+ *     card and attaches to the new one (same process, no re-setup needed)
+ */
+function watchSession(): void {
+  const sessionRef = rtdbRef(rtdb, `${SESSION_ROOT}/${cfg.workspaceId}/${SESSION_ID}`);
+  let seenInitial = false;
+  sessionWatchUnsub = onValue(sessionRef, (snap) => {
+    if (!snap.exists()) return;
+    const val = snap.val() as { assignedCard?: { cardId: string; boardId: string; nodeId: string } | null };
+    // Skip the first snapshot — it echoes our own initSession write.
+    if (!seenInitial) { seenInitial = true; return; }
+
+    // UI calls rtdbUpdate({assignedCard: null}) to detach. Firebase treats
+    // `null` in an update as a key delete, so in the snapshot the field is
+    // `undefined` (not `null`). Check for falsy to catch both.
+    const uiCard = val.assignedCard ?? null;
+
+    if (!uiCard) {
+      if (currentCard) {
+        logInfo("UI removed card assignment — going idle");
+        void goIdle();
+      }
+      return;
+    }
+
+    if (!currentCard || currentCard.nodeId !== uiCard.nodeId) {
+      logInfo(`UI moved agent to card ${uiCard.cardId} — attaching`);
+      void attachCard(uiCard);
+    }
+  });
+}
+
+/**
+ * Park the daemon as idle: stop the Firestore watcher + clear presence,
+ * update the RTDB session to `status: "idle"` + `assignedCard: null`.
+ * The daemon keeps running so the user can reassign it from the UI.
+ */
+async function goIdle(): Promise<void> {
+  detachCard();
+  const uid = auth.currentUser?.uid;
+  if (!uid) return;
+  const sessionRef = rtdbRef(rtdb, `${SESSION_ROOT}/${cfg.workspaceId}/${SESSION_ID}`);
+  await rtdbUpdate(sessionRef, {
+    status: "idle",
+    assignedCard: null,
+    lastHeartbeat: Date.now(),
+  }).catch((e) => logError(`goIdle session update failed: ${String(e)}`));
+}
 
 /* ------------------------------------------------------------------ */
 /*  API relay helpers                                                   */
@@ -351,13 +527,59 @@ let initialLoad = true;
 
 type TaskEntry = { id: string; title?: string; taskNumber?: number };
 
-async function subscribe(): Promise<void> {
-  await ensureAuth();
-  await writeSession();
-  await setStatus("subscribed");
+/**
+ * Stop watching the current card. Keeps the daemon process alive and the
+ * RTDB session present — it just parks the agent in "idle" so it shows up
+ * in the user's team-members panel for reassignment.
+ */
+function detachCard(): void {
+  if (nodeUnsub) { nodeUnsub(); nodeUnsub = null; }
+  processedTaskIds.clear();
+  initialLoad = true;
 
-  const nodeRef = doc(db, "workspaces", cfg.workspaceId, "boards", cfg.boardId, "canvasNodes", cfg.nodeId);
+  const prev = currentCard;
+  currentCard = null;
+  if (!prev) return;
 
+  // Best-effort: clear the aiPresence marker we wrote for this card.
+  const uid = auth.currentUser?.uid;
+  if (uid) {
+    const presenceRef = rtdbRef(rtdb, `${PRESENCE_ROOT}/${cfg.workspaceId}/${prev.nodeId}/${uid}`);
+    rtdbRemove(presenceRef).catch(() => {});
+  }
+  logInfo(`detached from card ${prev.cardId}`);
+}
+
+/**
+ * Subscribe to a card's canvasNode and start dispatching any new tasks
+ * assigned to it. Safe to call for a switch (stops the previous watcher).
+ */
+async function attachCard(card: { cardId: string; boardId: string; nodeId: string }): Promise<void> {
+  if (currentCard && currentCard.nodeId === card.nodeId) return;
+  detachCard();
+
+  currentCard = card;
+  initialLoad = true;
+  processedTaskIds.clear();
+
+  // Sync RTDB: session status + assignedCard so the UI badge lands on this
+  // card, and aiPresence so the "MCP Subscribed" glow appears.
+  const uid = auth.currentUser?.uid;
+  if (uid) {
+    const sessionRef = rtdbRef(rtdb, `${SESSION_ROOT}/${cfg.workspaceId}/${SESSION_ID}`);
+    await rtdbUpdate(sessionRef, {
+      status: "subscribed",
+      assignedCard: card,
+      lastHeartbeat: Date.now(),
+    }).catch((e) => logError(`attachCard session update failed: ${String(e)}`));
+    await onDisconnect(sessionRef).remove();
+
+    const presenceRef = rtdbRef(rtdb, `${PRESENCE_ROOT}/${cfg.workspaceId}/${card.nodeId}/${uid}`);
+    await rtdbSet(presenceRef, { active: true, subscribedAt: Date.now(), daemon: true });
+    await onDisconnect(presenceRef).remove();
+  }
+
+  const nodeRef = doc(db, "workspaces", cfg.workspaceId, "boards", card.boardId, "canvasNodes", card.nodeId);
   nodeUnsub = onSnapshot(nodeRef, (snap) => {
     if (!snap.exists()) {
       logError("agent card not found — did it get deleted?");
@@ -397,22 +619,44 @@ async function subscribe(): Promise<void> {
     logError(`firestore listener error: ${String(err)}`);
   });
 
-  logInfo(`subscribed to card ${cfg.agentCardId}`);
+  logInfo(`attached to card ${card.cardId}`);
+}
+
+/**
+ * Bootstrap: auth → session record → UI watchers → attach to the card
+ * baked into ~/.isteam/daemon.json. If the user later drags the agent
+ * off or onto a different card, watchSession handles the transition.
+ */
+async function subscribe(): Promise<void> {
+  await ensureAuth();
+  await initSession();
+  watchConnection();
+  watchSession();
+  await attachCard({ cardId: cfg.agentCardId, boardId: cfg.boardId, nodeId: cfg.nodeId });
 }
 
 /* ------------------------------------------------------------------ */
 /*  Lifecycle                                                           */
 /* ------------------------------------------------------------------ */
 
+let shuttingDown = false;
+
 async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
   logInfo(`shutdown (${signal})`);
-  if (nodeUnsub) nodeUnsub();
+  if (sessionWatchUnsub) { sessionWatchUnsub(); sessionWatchUnsub = null; }
+  if (connectWatchUnsub) { connectWatchUnsub(); connectWatchUnsub = null; }
+  if (nodeUnsub) { nodeUnsub(); nodeUnsub = null; }
+  if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
+
   try {
     const sessionRef = rtdbRef(rtdb, `${SESSION_ROOT}/${cfg.workspaceId}/${SESSION_ID}`);
     await rtdbRemove(sessionRef);
     const uid = auth.currentUser?.uid;
-    if (uid) {
-      const presenceRef = rtdbRef(rtdb, `${PRESENCE_ROOT}/${cfg.workspaceId}/${cfg.nodeId}/${uid}`);
+    if (uid && currentCard) {
+      const presenceRef = rtdbRef(rtdb, `${PRESENCE_ROOT}/${cfg.workspaceId}/${currentCard.nodeId}/${uid}`);
       await rtdbRemove(presenceRef);
     }
   } catch (e) {

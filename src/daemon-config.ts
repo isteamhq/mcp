@@ -24,10 +24,10 @@ export interface DaemonConfig {
   /** is.team API token (ist_…) */
   token: string;
   /**
-   * User-chosen 5-char alphanumeric name for this agent (e.g. "HOME1",
-   * "MACM1", "DEV01"). Appears in the is.team dashboard as the agent's
+   * User-chosen 6-char alphanumeric name for this agent (e.g. "HOME01",
+   * "MACM01", "DEV001"). Appears in the is.team dashboard as the agent's
    * badge. Distinguishes this terminal/daemon from other agents run by
-   * the same user. Must match /^[A-Z0-9]{5}$/.
+   * the same user. Must match /^[A-Z0-9]{6}$/.
    */
   agentName: string;
   /** Card id the daemon listens to (col-…) */
@@ -52,7 +52,7 @@ export interface DaemonConfig {
 
 /** Validation helper used by both setup wizard and runtime. */
 export function isValidAgentName(s: string): boolean {
-  return /^[A-Z0-9]{5}$/.test(s);
+  return /^[A-Z0-9]{6}$/.test(s);
 }
 
 export function ensureIsteamDir(): void {

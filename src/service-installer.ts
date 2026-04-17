@@ -209,8 +209,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=${execStart}
-Restart=always
+Restart=on-failure
 RestartSec=10
+SuccessExitStatus=0
 StandardOutput=append:${DAEMON_LOG}
 StandardError=append:${DAEMON_ERROR_LOG}
 

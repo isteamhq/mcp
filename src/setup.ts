@@ -85,7 +85,7 @@ function resolveClaudePath(): string {
 }
 
 /**
- * Ask the user for a 5-char agent name. Loops until input validates.
+ * Ask the user for a 6-char agent name. Loops until input validates.
  * In --yes mode, synthesize a random one to keep non-interactive callers
  * (CI, scripts) working without prompting.
  */
@@ -93,15 +93,15 @@ async function askAgentName(yesMode: boolean): Promise<string> {
   if (yesMode) {
     const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let id = "";
-    for (let i = 0; i < 5; i++) id += chars[Math.floor(Math.random() * chars.length)];
+    for (let i = 0; i < 6; i++) id += chars[Math.floor(Math.random() * chars.length)];
     info(`--yes mode: auto-generated agent name ${id}`);
     return id;
   }
   for (;;) {
-    const raw = await ask(`${BOLD}Agent name (5 chars):${RESET} `);
+    const raw = await ask(`${BOLD}Agent name (6 chars):${RESET} `);
     const norm = raw.trim().toUpperCase();
     if (isValidAgentName(norm)) return norm;
-    warn("Must be exactly 5 alphanumeric characters (A-Z, 0-9). Try again.");
+    warn("Must be exactly 6 alphanumeric characters (A-Z, 0-9). Try again.");
   }
 }
 
@@ -209,8 +209,8 @@ async function main() {
 
   // Step 5: Ask for agent name (mandatory)
   log(`${BOLD}Agent name${RESET}`);
-  log("Pick a 5-character label that identifies this terminal in the is.team dashboard.");
-  log(`Examples: ${DIM}HOME1, MACM1, DEV01, LAPTP, PROD1${RESET}. Uppercase letters and digits only.`);
+  log("Pick a 6-character label that identifies this terminal in the is.team dashboard.");
+  log(`Examples: ${DIM}HOME01, MACM01, DEV001, LAPTP1, PROD01${RESET}. Uppercase letters and digits only.`);
   log("Use a different name in each project/terminal so you can tell your agents apart.");
   log("");
 

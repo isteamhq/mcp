@@ -62,24 +62,24 @@ const client = new IsTeamClient(BASE_URL, API_TOKEN);
 /*  Agent Session Identity                                             */
 /* ------------------------------------------------------------------ */
 
-/** Generate a random 5-char alphanumeric ID (uppercase) — fallback only. */
+/** Generate a random 6-char alphanumeric ID (uppercase) — fallback only. */
 function generateAgentId(): string {
   const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
   let id = "";
-  for (let i = 0; i < 5; i++) id += chars[Math.floor(Math.random() * chars.length)];
+  for (let i = 0; i < 6; i++) id += chars[Math.floor(Math.random() * chars.length)];
   return id;
 }
 
 /**
  * Prefer the user-provided agent name (set via setup wizard, stored in the
- * project's .mcp.json env). Must be 5 alphanumeric characters — validated
+ * project's .mcp.json env). Must be 6 alphanumeric characters — validated
  * here so a malformed env value doesn't poison the UI badge.
  */
 function resolveAgentId(): string {
   const raw = process.env.IST_AGENT_NAME?.trim().toUpperCase();
-  if (raw && /^[A-Z0-9]{5}$/.test(raw)) return raw;
+  if (raw && /^[A-Z0-9]{6}$/.test(raw)) return raw;
   if (raw) {
-    process.stderr.write(`[mcp] IST_AGENT_NAME "${raw}" is invalid (must be 5 alphanumeric chars) — using random fallback.\n`);
+    process.stderr.write(`[mcp] IST_AGENT_NAME "${raw}" is invalid (must be 6 alphanumeric chars) — using random fallback.\n`);
   }
   return generateAgentId();
 }
@@ -211,20 +211,37 @@ let agentWorkspaceIds: string[] = [];
 const sessionWatchers: Array<() => void> = [];
 const sessionHeartbeatIntervals: Array<ReturnType<typeof setInterval>> = [];
 
+/**
+ * Single source of truth for this agent's card assignment, shared across
+ * every workspace this MCP writes sessions into. Per-workspace session
+ * entries mirror this value — the watcher detects UI-driven drifts and
+ * pushes them back here + fans them out to the other workspaces so the
+ * "I have TEST5 idle in workspace B" bug can't happen while TEST5 is
+ * subscribed in workspace A.
+ */
+let authoritativeAssignedCard: { cardId: string; boardId: string; nodeId: string } | null = null;
+
 async function writeAgentSession(workspaceId: string): Promise<void> {
   const uid = getAuthUid();
   if (!uid) return;
   const db = getRtdb();
 
-  // Remove any existing sessions from the same token/uid (one token = one agent)
+  // Remove ONLY zombie sessions for this uid (no heartbeat in > 2 minutes).
+  // A user can legitimately run multiple MCPs for the same token — e.g.
+  // a background daemon plus an interactive Claude Code stdio MCP — and
+  // they must coexist. If we wiped every peer, they would ping-pong
+  // deleting each other's sessions every heartbeat.
+  const STALE_THRESHOLD = 2 * 60 * 1000;
   const wsRef = rtdbRef(db, `${AGENT_SESSION_ROOT}/${workspaceId}`);
   const snap = await rtdbGet(wsRef);
   if (snap.exists()) {
-    const sessions = snap.val() as Record<string, { uid?: string }>;
+    const sessions = snap.val() as Record<string, { uid?: string; lastHeartbeat?: number }>;
+    const now = Date.now();
     for (const [sid, data] of Object.entries(sessions)) {
-      if (data.uid === uid && sid !== SESSION_ID) {
+      const stale = now - (data.lastHeartbeat ?? 0) > STALE_THRESHOLD;
+      if (data.uid === uid && sid !== SESSION_ID && stale) {
         await rtdbRemove(rtdbRef(db, `${AGENT_SESSION_ROOT}/${workspaceId}/${sid}`));
-        process.stderr.write(`[mcp] Removed existing session ${sid} for same token\n`);
+        process.stderr.write(`[mcp] Removed zombie session ${sid} (no heartbeat for ${Math.round((now - (data.lastHeartbeat ?? 0)) / 1000)}s)\n`);
       }
     }
   }
@@ -234,8 +251,8 @@ async function writeAgentSession(workspaceId: string): Promise<void> {
     uid,
     agentId: AGENT_ID,
     mode: agentMode,
-    status: "idle",
-    assignedCard: null,
+    status: authoritativeAssignedCard ? "subscribed" : "idle",
+    assignedCard: authoritativeAssignedCard,
     connectedAt: Date.now(),
     lastHeartbeat: Date.now(),
   };
@@ -322,13 +339,36 @@ async function startAgentSessions(workspaceIds: string[]): Promise<void> {
         assignedCard?: { cardId: string; boardId: string; nodeId: string } | null;
       };
 
-      const newNodeId = val.assignedCard?.nodeId ?? null;
+      const incomingCard = val.assignedCard ?? null;
+      const incomingKey = JSON.stringify(incomingCard);
+      const authoritativeKey = JSON.stringify(authoritativeAssignedCard);
+
+      // RTDB value matches our authoritative state — either our own write
+      // echoing back, a heartbeat touching only lastHeartbeat, or another
+      // workspace's propagation landing here. Either way, no action.
+      if (incomingKey === authoritativeKey) return;
+
+      // UI changed the value. Adopt the new state globally and propagate to
+      // every other workspace's session entry so this MCP can't appear idle
+      // in workspace B while subscribed in workspace A.
+      authoritativeAssignedCard = incomingCard;
+      for (const otherWsId of agentWorkspaceIds) {
+        if (otherWsId === wsId) continue;
+        const otherRef = rtdbRef(db, `${AGENT_SESSION_ROOT}/${otherWsId}/${SESSION_ID}`);
+        rtdbUpdate(otherRef, {
+          assignedCard: incomingCard,
+          status: incomingCard ? "subscribed" : "idle",
+          lastHeartbeat: Date.now(),
+        }).catch((e) => process.stderr.write(`[mcp] propagate to ${otherWsId} failed: ${String(e)}\n`));
+      }
+
+      const newNodeId = incomingCard?.nodeId ?? null;
 
       // UI assigned a card while agent is idle → auto-subscribe
-      if (newNodeId && !prevAssignedNodeId && val.status === "idle" && val.assignedCard) {
+      if (newNodeId && !prevAssignedNodeId && incomingCard) {
         prevAssignedNodeId = newNodeId;
-        process.stderr.write(`[mcp] UI assigned card ${val.assignedCard.cardId} — auto-subscribing...\n`);
-        await performSubscribe(val.assignedCard.cardId, wsId, val.assignedCard.boardId, val.assignedCard.nodeId, true);
+        process.stderr.write(`[mcp] UI assigned card ${incomingCard.cardId} — auto-subscribing...\n`);
+        await performSubscribe(incomingCard.cardId, wsId, incomingCard.boardId, incomingCard.nodeId, true);
       }
 
       // UI removed card assignment while agent is subscribed → auto-unsubscribe
@@ -339,6 +379,17 @@ async function startAgentSessions(workspaceIds: string[]): Promise<void> {
           process.stderr.write(`[mcp] UI removed card assignment — auto-unsubscribing ${oldCardId}...\n`);
           await performUnsubscribe(oldCardId, true);
         }
+      }
+
+      // UI moved the agent to a different card → unsubscribe from old, subscribe to new
+      if (newNodeId && prevAssignedNodeId && newNodeId !== prevAssignedNodeId && incomingCard) {
+        const oldCardId = findCardIdByNodeId(prevAssignedNodeId);
+        if (oldCardId) {
+          process.stderr.write(`[mcp] UI moved agent from ${oldCardId} to ${incomingCard.cardId} — re-subscribing...\n`);
+          await performUnsubscribe(oldCardId, true);
+        }
+        prevAssignedNodeId = newNodeId;
+        await performSubscribe(incomingCard.cardId, wsId, incomingCard.boardId, incomingCard.nodeId, true);
       }
     });
     sessionWatchers.push(unsub);

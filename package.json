@@ -1,6 +1,6 @@
 {
   "name": "@isteam/mcp",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "MCP server for is.team — manage tasks, get real-time notifications, and automate workflows via AI agents",
   "type": "module",
   "main": "./dist/index.js",
