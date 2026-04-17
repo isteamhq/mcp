@@ -13,7 +13,10 @@ import { createInterface } from "readline";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { join } from "path";
 import { execSync, spawn } from "child_process";
-import { homedir } from "os";
+import { homedir, platform } from "os";
+
+import { writeDaemonConfig, type PermissionMode } from "./daemon-config.js";
+import { installService, currentPlatform } from "./service-installer.js";
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
@@ -48,6 +51,22 @@ async function confirm(question: string): Promise<boolean> {
   return answer.toLowerCase() === "y" || answer.toLowerCase() === "yes";
 }
 
+async function selectFromList<T>(
+  question: string,
+  options: Array<{ label: string; value: T }>,
+): Promise<T> {
+  log(question);
+  options.forEach((opt, i) => log(`  ${BOLD}${i + 1}${RESET}. ${opt.label}`));
+  for (;;) {
+    const answer = await ask(`${BOLD}Choice [1-${options.length}]:${RESET} `);
+    const n = parseInt(answer, 10);
+    if (Number.isFinite(n) && n >= 1 && n <= options.length) {
+      return options[n - 1].value;
+    }
+    warn(`Invalid choice. Enter 1-${options.length}.`);
+  }
+}
+
 function commandExists(cmd: string): boolean {
   try {
     execSync(`which ${cmd}`, { stdio: "pipe" });
@@ -55,6 +74,14 @@ function commandExists(cmd: string): boolean {
   } catch {
     return false;
   }
+}
+
+function resolveClaudePath(): string {
+  try {
+    const p = execSync("which claude", { stdio: "pipe" }).toString().trim();
+    if (p) return p;
+  } catch { /* ignore */ }
+  return "claude";
 }
 
 /* ------------------------------------------------------------------ */
@@ -215,7 +242,27 @@ async function main() {
 
   log("");
 
-  // Step 7: Ask about autonomy mode
+  // Step 7: Run in background? (daemon mode)
+  const canDaemon = !!currentPlatform();
+  if (canDaemon && !argYes) {
+    log(`${BOLD}Background mode${RESET}`);
+    log("Run Claude as a persistent daemon: survives terminal closure, auto-restarts on crash,");
+    log("and auto-executes any task assigned to a chosen card. You control it entirely from is.team.");
+    log("");
+
+    const wantsDaemon = await confirm("Run in background as a daemon?");
+    log("");
+
+    if (wantsDaemon) {
+      await setupDaemon(token, cwd);
+      return;
+    }
+  } else if (!canDaemon) {
+    info(`Background mode skipped — ${platform()} is not supported yet (macOS/Linux only).`);
+    log("");
+  }
+
+  // Step 8: Autonomy mode (foreground path)
   log(`${BOLD}Autonomy Mode${RESET}`);
   log("When enabled, Claude will auto-approve all tool calls (file edits, bash commands, etc.).");
   log("You can control the agent entirely from the card chat — no terminal interaction needed.");
@@ -224,7 +271,7 @@ async function main() {
   const enableAutonomy = argYes || await confirm("Enable full autonomy mode? (recommended for MCP agents)");
   log("");
 
-  // Step 8: Launch Claude
+  // Step 9: Launch Claude
   log(`${BOLD}Starting Claude with MCP streaming...${RESET}`);
   if (enableAutonomy) {
     success("Autonomy mode enabled — all permissions auto-approved");
@@ -250,6 +297,128 @@ async function main() {
   claude.on("exit", (code) => {
     process.exit(code ?? 0);
   });
+}
+
+/* ------------------------------------------------------------------ */
+/*  Daemon setup flow                                                  */
+/* ------------------------------------------------------------------ */
+
+interface CardSummary {
+  cardId: string;
+  title: string;
+  workspace: string;
+  board: string;
+  workspaceId: string;
+  boardId: string;
+  nodeId: string;
+}
+
+async function fetchCards(token: string): Promise<CardSummary[]> {
+  const res = await fetch("https://is.team/api/mcp/exec", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ tool: "list_cards" }),
+  });
+  if (!res.ok) throw new Error(`list_cards failed: ${res.status}`);
+  const text = await res.text();
+  try {
+    const json = JSON.parse(text) as { cards?: CardSummary[] };
+    return json.cards ?? [];
+  } catch {
+    throw new Error("list_cards returned non-JSON response");
+  }
+}
+
+async function setupDaemon(token: string, cwd: string): Promise<void> {
+  log(`${BOLD}Daemon setup${RESET}`);
+  log(`${DIM}${"─".repeat(40)}${RESET}`);
+  log("");
+
+  // Pick agent card
+  log("Fetching your cards...");
+  let cards: CardSummary[];
+  try {
+    cards = await fetchCards(token);
+  } catch (e) {
+    error(`Failed to list cards: ${String(e)}`);
+    process.exit(1);
+  }
+  if (cards.length === 0) {
+    error("No cards with LLM access found.");
+    info("Create a card in is.team and enable LLM access, then run setup again.");
+    process.exit(1);
+  }
+
+  log("");
+  const chosen = await selectFromList(
+    `${BOLD}Pick the card the daemon should watch:${RESET}`,
+    cards.map((c) => ({
+      label: `${c.workspace} / ${c.board} / ${c.title} ${DIM}(${c.cardId})${RESET}`,
+      value: c,
+    })),
+  );
+  log("");
+
+  // Permission mode
+  const permissionMode: PermissionMode = await selectFromList(
+    `${BOLD}Permission mode for Claude subprocesses:${RESET}`,
+    [
+      { label: `acceptEdits ${DIM}— auto-approve file edits, prompt for shell commands (recommended)${RESET}`, value: "acceptEdits" },
+      { label: `bypassPermissions ${DIM}— fully autonomous, no prompts (risky, use only on trusted cards)${RESET}`, value: "bypassPermissions" },
+      { label: `plan ${DIM}— planning mode only, no writes${RESET}`, value: "plan" },
+    ],
+  );
+  log("");
+
+  // Working directory
+  const wdAnswer = await ask(`${BOLD}Working directory${RESET} ${DIM}(default: ${cwd})${RESET}: `);
+  const workingDir = wdAnswer.trim() || cwd;
+  if (!existsSync(workingDir)) {
+    error(`Directory does not exist: ${workingDir}`);
+    process.exit(1);
+  }
+  log("");
+
+  // Persist config
+  const claudePath = resolveClaudePath();
+  writeDaemonConfig({
+    token,
+    agentCardId: chosen.cardId,
+    workspaceId: chosen.workspaceId,
+    boardId: chosen.boardId,
+    nodeId: chosen.nodeId,
+    cardTitle: chosen.title,
+    workingDir,
+    permissionMode,
+    claudePath,
+  });
+  success(`Config written to ~/.isteam/daemon.json`);
+
+  // Install service
+  log("");
+  log(`${BOLD}Installing service...${RESET}`);
+  try {
+    installService();
+    success("Service installed and started");
+  } catch (e) {
+    error(`Service install failed: ${String(e)}`);
+    info("You can retry with: npx @isteam/mcp daemon install");
+    process.exit(1);
+  }
+
+  log("");
+  log(`${GREEN}${BOLD}✓ Daemon is running${RESET}`);
+  log("");
+  log(`The daemon is watching ${BOLD}${chosen.workspace} / ${chosen.title}${RESET}.`);
+  log(`Any task assigned to this card will be picked up automatically.`);
+  log("");
+  log(`${BOLD}Management commands:${RESET}`);
+  log(`  ${CYAN}npx @isteam/mcp daemon status${RESET}      check daemon state`);
+  log(`  ${CYAN}npx @isteam/mcp daemon logs --follow${RESET} tail output`);
+  log(`  ${CYAN}npx @isteam/mcp daemon restart${RESET}     restart daemon`);
+  log(`  ${CYAN}npx @isteam/mcp daemon stop${RESET}        stop daemon`);
+  log(`  ${CYAN}npx @isteam/mcp daemon uninstall${RESET}   remove daemon`);
+  log("");
 }
 
 main().catch((e) => {

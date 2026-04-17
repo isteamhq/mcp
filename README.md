@@ -55,6 +55,51 @@ Use `subscribe_card` to watch a card for new tasks. When a task is created or mo
 
 The AI agent will receive instant notifications and can start working immediately.
 
+## Background daemon mode (v2.0+)
+
+Run Claude as a persistent background daemon that auto-executes any task assigned to a chosen card. The daemon survives terminal closure, restarts itself on crashes, and relays Claude's output back to the card chat so you can monitor progress entirely from is.team.
+
+### Setup
+
+```bash
+npx @isteam/mcp@latest setup --token ist_xxx
+```
+
+When asked `Run in background as a daemon?`, answer `y`. The wizard will:
+1. List your cards — pick the one the daemon should watch
+2. Ask for a permission mode (`acceptEdits` recommended)
+3. Ask for a working directory (defaults to current)
+4. Install a launchd agent (macOS) or systemd user unit (Linux)
+5. Start the daemon
+
+Now assign a task to the chosen card and Claude will start working automatically — no terminal needed.
+
+### Managing the daemon
+
+```bash
+npx @isteam/mcp daemon status        # show current state + config summary
+npx @isteam/mcp daemon logs --follow # tail the live log
+npx @isteam/mcp daemon start|stop|restart
+npx @isteam/mcp daemon uninstall     # remove the service
+```
+
+### How it works
+
+- macOS: `~/Library/LaunchAgents/team.is.mcp-daemon.plist`
+- Linux: `~/.config/systemd/user/isteam-mcp-daemon.service`
+- Config: `~/.isteam/daemon.json` (0600 — contains your API token)
+- Logs:   `~/.isteam/daemon.log` + `~/.isteam/daemon-error.log`
+
+Each task spawns a one-shot `claude --print` subprocess with the repo's MCP config loaded. Claude reads the task, executes it, posts a summary back to the card chat, and moves the task to the next pipeline card.
+
+### Platform support
+
+| Platform | Status |
+|---|---|
+| macOS (launchd) | ✅ supported |
+| Linux (systemd) | ✅ supported |
+| Windows | ⚠️ not yet — use WSL2 or foreground mode |
+
 ## Enable LLM access on a card
 
 Before an AI agent can interact with a card:

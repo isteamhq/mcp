@@ -1,8 +1,15 @@
-// Redirect to setup wizard if "setup" is the first argument
-if (process.argv.includes("setup")) {
+// Route top-level subcommands (setup, daemon) before starting the MCP server.
+const firstArg = process.argv[2];
+
+if (firstArg === "setup") {
   await import("./setup.js");
-  // setup.ts handles process.exit — this line is a safety net
-  await new Promise(() => {});
+  await new Promise(() => {}); // setup.ts handles exit
+}
+
+if (firstArg === "daemon") {
+  const { runDaemonCli } = await import("./daemon-cli.js");
+  await runDaemonCli(process.argv.slice(3));
+  process.exit(0);
 }
 
 import { z } from "zod";
@@ -451,7 +458,7 @@ const UnsubscribeCardSchema = {
 /* ------------------------------------------------------------------ */
 
 const server = new McpServer(
-  { name: "is.team", version: "1.9.0" },
+  { name: "is.team", version: "2.0.0" },
   {
     capabilities: {
       tools: {},
