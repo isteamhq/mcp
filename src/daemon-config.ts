@@ -24,22 +24,27 @@ export interface DaemonConfig {
   /** is.team API token (ist_…) */
   token: string;
   /**
-   * User-chosen 6-char alphanumeric name for this agent (e.g. "HOME01",
-   * "MACM01", "DEV001"). Appears in the is.team dashboard as the agent's
+   * User-chosen 1-6 char alphanumeric name for this agent (e.g. "ME",
+   * "HOME01", "DEV"). Appears in the is.team dashboard as the agent's
    * badge. Distinguishes this terminal/daemon from other agents run by
-   * the same user. Must match /^[A-Z0-9]{6}$/.
+   * the same user. Must match /^[A-Z0-9]{1,6}$/.
    */
   agentName: string;
-  /** Card id the daemon listens to (col-…) */
-  agentCardId: string;
-  /** Workspace id */
+  /**
+   * Card the daemon initially attaches to. Optional — the agent now starts
+   * idle and the user assigns it from the UI by dragging the agent badge
+   * onto a card. Older configs may still have these populated; the daemon
+   * honors them on first boot for backward compatibility.
+   */
+  agentCardId?: string;
+  /** Workspace id — required so the agent registers in the right workspace. */
   workspaceId: string;
-  /** Board id */
-  boardId: string;
-  /** Node id (same as cardId for kanban columns, but kept explicit) */
-  nodeId: string;
-  /** Card display title — used in logs/chat relay */
-  cardTitle: string;
+  /** Board id (only set when agentCardId is set). */
+  boardId?: string;
+  /** Node id (only set when agentCardId is set). */
+  nodeId?: string;
+  /** Card display title (only set when agentCardId is set). */
+  cardTitle?: string;
   /** Working directory Claude runs in */
   workingDir: string;
   /** Permission flag passed to claude */
@@ -52,7 +57,7 @@ export interface DaemonConfig {
 
 /** Validation helper used by both setup wizard and runtime. */
 export function isValidAgentName(s: string): boolean {
-  return /^[A-Z0-9]{6}$/.test(s);
+  return /^[A-Z0-9]{1,6}$/.test(s);
 }
 
 export function ensureIsteamDir(): void {

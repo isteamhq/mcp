@@ -85,7 +85,11 @@ process.on("unhandledRejection", (reason) => {
   logError(`unhandledRejection: ${reason instanceof Error ? reason.stack ?? reason.message : String(reason)}`);
 });
 
-logInfo(`daemon starting — agent card ${cfg.agentCardId} (${cfg.cardTitle}) in workspace ${cfg.workspaceId}`);
+if (cfg.agentCardId) {
+  logInfo(`daemon starting — agent card ${cfg.agentCardId} (${cfg.cardTitle}) in workspace ${cfg.workspaceId}`);
+} else {
+  logInfo(`daemon starting — idle in workspace ${cfg.workspaceId}, waiting for UI assignment`);
+}
 logInfo(`working directory: ${cfg.workingDir}`);
 logInfo(`permission mode: ${cfg.permissionMode}`);
 logInfo(`claude path: ${cfg.claudePath}`);
@@ -135,9 +139,10 @@ const AGENT_ID   = isValidAgentName(cfg.agentName)
   ? cfg.agentName
   : (() => {
       // Old configs won't have agentName — synthesize a deterministic fallback
-      // from the card id so the badge stays stable across restarts.
-      const suffix = cfg.agentCardId.slice(-5).toUpperCase().padStart(5, "0");
-      return ("D" + suffix).slice(0, 6);
+      // from whatever stable id is available so the badge stays consistent
+      // across restarts.
+      const seed = (cfg.agentCardId ?? cfg.workspaceId ?? "AGENT0").slice(-5).toUpperCase().padStart(5, "0");
+      return ("D" + seed).slice(0, 6);
     })();
 const SESSION_ROOT = "agentSessions";
 const PRESENCE_ROOT = "aiPresence";
@@ -382,7 +387,14 @@ async function apiExec(tool: string, cardId: string, args: Record<string, unknow
 }
 
 async function postChat(msg: string): Promise<void> {
-  await apiExec("chat_respond", cfg.agentCardId, { content: msg }).catch((e) =>
+  // Prefer the card we are currently attached to (UI may have moved us).
+  // Fall back to the bootstrap card if a legacy config supplied one.
+  const targetCardId = currentCard?.cardId ?? cfg.agentCardId;
+  if (!targetCardId) {
+    logError(`postChat skipped — no card attached: ${msg.slice(0, 80)}`);
+    return;
+  }
+  await apiExec("chat_respond", targetCardId, { content: msg }).catch((e) =>
     logError(`postChat failed: ${String(e)}`),
   );
 }
@@ -418,15 +430,20 @@ function removeQueueEntry(taskId: string): void {
 /* ------------------------------------------------------------------ */
 
 function buildPrompt(task: QueuedTask): string {
+  // Tasks only flow in when we are attached to a card, so currentCard is set
+  // here. Fall back to legacy cfg fields just in case to keep this routine
+  // safe under unusual race conditions (e.g. detach mid-dispatch).
+  const cardId    = currentCard?.cardId ?? cfg.agentCardId ?? "(unknown card)";
+  const cardTitle = cfg.cardTitle ?? "(card)";
   return [
-    `You are the is.team autonomous agent assigned to card "${cfg.cardTitle}" (id: ${cfg.agentCardId}).`,
+    `You are the is.team autonomous agent assigned to card "${cardTitle}" (id: ${cardId}).`,
     ``,
     `A new task has been assigned to you:`,
     `  #${task.taskNumber} — ${task.title}`,
     `  task id: ${task.id}`,
     ``,
     `Do the following, in order:`,
-    `  1. Call the read_card tool with cardId "${cfg.agentCardId}" to see the task's full description, connected cards, and available move targets.`,
+    `  1. Call the read_card tool with cardId "${cardId}" to see the task's full description, connected cards, and available move targets.`,
     `  2. Work on the task using whatever tools you need (file edits, shell commands, web searches, etc.). When you need to ask the user a question, use ask_chat — they are monitoring the card chat, not the terminal.`,
     `  3. When the task is complete, use complete_task with the task number and move it to the appropriate connected card (usually "Done" or the next pipeline stage).`,
     `  4. Post a short chat summary (via chat_respond) describing what you did.`,
@@ -632,7 +649,13 @@ async function subscribe(): Promise<void> {
   await initSession();
   watchConnection();
   watchSession();
-  await attachCard({ cardId: cfg.agentCardId, boardId: cfg.boardId, nodeId: cfg.nodeId });
+  // Backward-compat: if a legacy config baked in a card, attach to it on
+  // boot. New configs (post-v2.3) start idle and rely on UI drag-to-assign.
+  if (cfg.agentCardId && cfg.boardId && cfg.nodeId) {
+    await attachCard({ cardId: cfg.agentCardId, boardId: cfg.boardId, nodeId: cfg.nodeId });
+  } else {
+    logInfo("idle — drag the agent onto a card from is.team to start watching it");
+  }
 }
 
 /* ------------------------------------------------------------------ */

@@ -85,7 +85,7 @@ function resolveClaudePath(): string {
 }
 
 /**
- * Ask the user for a 6-char agent name. Loops until input validates.
+ * Ask the user for an agent name (1–6 chars). Loops until input validates.
  * In --yes mode, synthesize a random one to keep non-interactive callers
  * (CI, scripts) working without prompting.
  */
@@ -98,10 +98,10 @@ async function askAgentName(yesMode: boolean): Promise<string> {
     return id;
   }
   for (;;) {
-    const raw = await ask(`${BOLD}Agent name (6 chars):${RESET} `);
+    const raw = await ask(`${BOLD}Agent name (max 6 chars):${RESET} `);
     const norm = raw.trim().toUpperCase();
     if (isValidAgentName(norm)) return norm;
-    warn("Must be exactly 6 alphanumeric characters (A-Z, 0-9). Try again.");
+    warn("Must be 1-6 alphanumeric characters (A-Z, 0-9). Try again.");
   }
 }
 
@@ -209,8 +209,8 @@ async function main() {
 
   // Step 5: Ask for agent name (mandatory)
   log(`${BOLD}Agent name${RESET}`);
-  log("Pick a 6-character label that identifies this terminal in the is.team dashboard.");
-  log(`Examples: ${DIM}HOME01, MACM01, DEV001, LAPTP1, PROD01${RESET}. Uppercase letters and digits only.`);
+  log("Pick a label (up to 6 characters) that identifies this terminal in the is.team dashboard.");
+  log(`Examples: ${DIM}ME, DEV, HOME01, LAPTP1, PROD01${RESET}. Uppercase letters and digits only.`);
   log("Use a different name in each project/terminal so you can tell your agents apart.");
   log("");
 
@@ -308,7 +308,14 @@ async function main() {
   if (enableAutonomy) {
     success("Autonomy mode enabled — all permissions auto-approved");
   }
-  log(`${DIM}Press Ctrl+C to stop${RESET}`);
+  log("");
+  log(`${BOLD}How to use the agent live:${RESET}`);
+  log(`  ${DIM}•${RESET} Open the workspace in is.team — your agent ${BOLD}${agentName}${RESET} appears in the top-right team panel.`);
+  log(`  ${DIM}•${RESET} Drag it onto a card to start chatting; messages flow into ${CYAN}card chat${RESET}, not this terminal.`);
+  log(`  ${DIM}•${RESET} Add tasks to the card — the agent picks them up automatically.`);
+  log(`  ${DIM}•${RESET} Press ${CYAN}Ctrl+C${RESET} here to stop the agent and free its slot in the workspace.`);
+  log(`  ${DIM}•${RESET} Closing this terminal also stops the agent. To keep it alive across reboots,`);
+  log(`     re-run setup and answer ${BOLD}yes${RESET} to background mode.`);
   log("");
 
   const claudeArgs = ["--dangerously-load-development-channels", "server:is-team"];
@@ -366,29 +373,40 @@ async function setupDaemon(token: string, cwd: string, agentName: string): Promi
   log(`${DIM}${"─".repeat(40)}${RESET}`);
   log("");
 
-  // Pick agent card
-  log("Fetching your cards...");
+  // Pick workspace (cards endpoint is the cheapest way to enumerate workspaces
+  // the user has access to — we dedup by workspaceId)
+  log("Fetching your workspaces...");
   let cards: CardSummary[];
   try {
     cards = await fetchCards(token);
   } catch (e) {
-    error(`Failed to list cards: ${String(e)}`);
+    error(`Failed to list workspaces: ${String(e)}`);
     process.exit(1);
   }
-  if (cards.length === 0) {
-    error("No cards with LLM access found.");
-    info("Create a card in is.team and enable LLM access, then run setup again.");
+  const workspaces = Array.from(
+    new Map(cards.map((c) => [c.workspaceId, { workspaceId: c.workspaceId, name: c.workspace }])).values(),
+  );
+  if (workspaces.length === 0) {
+    error("No workspaces with LLM access found.");
+    info("Open is.team, create a card with LLM access enabled, then run setup again.");
     process.exit(1);
   }
 
   log("");
-  const chosen = await selectFromList(
-    `${BOLD}Pick the card the daemon should watch:${RESET}`,
-    cards.map((c) => ({
-      label: `${c.workspace} / ${c.board} / ${c.title} ${DIM}(${c.cardId})${RESET}`,
-      value: c,
-    })),
-  );
+  let workspaceId: string;
+  let workspaceName: string;
+  if (workspaces.length === 1) {
+    workspaceId   = workspaces[0].workspaceId;
+    workspaceName = workspaces[0].name;
+    info(`Using your only workspace: ${BOLD}${workspaceName}${RESET}`);
+  } else {
+    const chosen = await selectFromList(
+      `${BOLD}Which workspace should this agent join?${RESET}`,
+      workspaces.map((w) => ({ label: w.name, value: w })),
+    );
+    workspaceId   = chosen.workspaceId;
+    workspaceName = chosen.name;
+  }
   log("");
 
   // Permission mode
@@ -411,16 +429,13 @@ async function setupDaemon(token: string, cwd: string, agentName: string): Promi
   }
   log("");
 
-  // Persist config
+  // Persist config — no card baked in; agent starts idle and the user assigns
+  // it from the workspace UI by dragging the agent badge onto a card.
   const claudePath = resolveClaudePath();
   writeDaemonConfig({
     token,
     agentName,
-    agentCardId: chosen.cardId,
-    workspaceId: chosen.workspaceId,
-    boardId: chosen.boardId,
-    nodeId: chosen.nodeId,
-    cardTitle: chosen.title,
+    workspaceId,
     workingDir,
     permissionMode,
     claudePath,
@@ -442,15 +457,22 @@ async function setupDaemon(token: string, cwd: string, agentName: string): Promi
   log("");
   log(`${GREEN}${BOLD}✓ Daemon is running${RESET}`);
   log("");
-  log(`The daemon is watching ${BOLD}${chosen.workspace} / ${chosen.title}${RESET}.`);
-  log(`Any task assigned to this card will be picked up automatically.`);
+  log(`Agent ${BOLD}${agentName}${RESET} is now online in workspace ${BOLD}${workspaceName}${RESET},`);
+  log(`waiting in the team-members panel for an assignment.`);
   log("");
-  log(`${BOLD}Management commands:${RESET}`);
+  log(`${BOLD}How to use it:${RESET}`);
+  log(`  ${DIM}1.${RESET} Open the workspace in is.team — your agent appears in the top-right team panel.`);
+  log(`  ${DIM}2.${RESET} Drag the agent badge onto any card to assign it. Tasks added to that card`);
+  log(`     will be picked up and executed automatically.`);
+  log(`  ${DIM}3.${RESET} Drag the agent off the card (or remove the assignment) to park it as idle.`);
+  log(`  ${DIM}4.${RESET} The agent keeps running after you close this terminal.`);
+  log("");
+  log(`${BOLD}Daemon commands:${RESET}`);
   log(`  ${CYAN}npx @isteam/mcp daemon status${RESET}      check daemon state`);
   log(`  ${CYAN}npx @isteam/mcp daemon logs --follow${RESET} tail output`);
   log(`  ${CYAN}npx @isteam/mcp daemon restart${RESET}     restart daemon`);
-  log(`  ${CYAN}npx @isteam/mcp daemon stop${RESET}        stop daemon`);
-  log(`  ${CYAN}npx @isteam/mcp daemon uninstall${RESET}   remove daemon`);
+  log(`  ${CYAN}npx @isteam/mcp daemon stop${RESET}        stop the daemon`);
+  log(`  ${CYAN}npx @isteam/mcp daemon uninstall${RESET}   remove the daemon entirely`);
   log("");
 }
 
