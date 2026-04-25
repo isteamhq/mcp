@@ -72,14 +72,14 @@ function generateAgentId(): string {
 
 /**
  * Prefer the user-provided agent name (set via setup wizard, stored in the
- * project's .mcp.json env). Must be 6 alphanumeric characters — validated
+ * project's .mcp.json env). Must be 1–6 alphanumeric characters — validated
  * here so a malformed env value doesn't poison the UI badge.
  */
 function resolveAgentId(): string {
   const raw = process.env.IST_AGENT_NAME?.trim().toUpperCase();
-  if (raw && /^[A-Z0-9]{6}$/.test(raw)) return raw;
+  if (raw && /^[A-Z0-9]{1,6}$/.test(raw)) return raw;
   if (raw) {
-    process.stderr.write(`[mcp] IST_AGENT_NAME "${raw}" is invalid (must be 6 alphanumeric chars) — using random fallback.\n`);
+    process.stderr.write(`[mcp] IST_AGENT_NAME "${raw}" is invalid (must be 1-6 alphanumeric chars) — using random fallback.\n`);
   }
   return generateAgentId();
 }
@@ -135,11 +135,98 @@ function getRtdb(): Database {
   return realtimeDb;
 }
 
-const AI_PRESENCE_ROOT = "aiPresence";
+const AI_PRESENCE_ROOT     = "aiPresence";
+const AGENT_ACTIVITY_ROOT  = "agentActivity";
 
 function getAuthUid(): string | null {
   const auth = getAuth(getApp());
   return auth.currentUser?.uid ?? null;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Agent activity (real-time tool-call indicator for the UI)          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Human-readable label for the current tool call. Prefer specifics that the
+ * UI can render in a small pill (≤ ~40 chars). Used by `writeAgentActivity`.
+ */
+function describeActivity(tool: string, args: Record<string, unknown>): string {
+  const num = typeof args.taskNumber === "number" ? `#${args.taskNumber}` : "";
+  const title = typeof args.title === "string" && args.title.trim()
+    ? `: ${args.title.trim().slice(0, 40)}`
+    : "";
+  switch (tool) {
+    case "list_cards":         return "Listing cards";
+    case "read_card":          return "Reading card";
+    case "create_task":        return `Creating task${title}`;
+    case "update_task":        return `Updating task ${num}`.trim();
+    case "complete_task":      return `Completing task ${num}`.trim();
+    case "move_task":          return `Moving task ${num}`.trim();
+    case "add_comment":        return `Commenting on task ${num}`.trim();
+    case "log_time":           return `Logging time on task ${num}`.trim();
+    case "reorder_tasks":      return "Reordering tasks";
+    case "chat_respond":       return "Replying in chat";
+    case "chat_history":       return "Reading chat history";
+    case "ask_chat":           return "Asking the user";
+    case "create_note":        return `Creating note${title}`;
+    case "update_note":        return "Updating note";
+    case "create_edge":        return "Connecting cards";
+    case "delete_edge":        return "Disconnecting cards";
+    case "move_node":          return "Moving node";
+    case "create_stack":       return "Creating stack";
+    case "add_to_stack":       return "Adding to stack";
+    case "dissolve_stack":     return "Dissolving stack";
+    case "subscribe_card":     return "Subscribing to card";
+    case "unsubscribe_card":   return "Unsubscribing from card";
+    case "list_integrations":  return "Checking integrations";
+    default:                   return tool.replace(/_/g, " ");
+  }
+}
+
+/**
+ * Write the agent's current tool call to RTDB so every workspace this
+ * session is registered in can render a "ISTEAM is creating a task..."
+ * indicator on the assigned card. Best-effort — failures don't surface
+ * to the tool result.
+ */
+async function writeAgentActivity(tool: string, args: Record<string, unknown>): Promise<void> {
+  if (!firebaseAuthenticated) return;
+  const uid = getAuthUid();
+  if (!uid) return;
+  if (agentWorkspaceIds.length === 0) return;
+
+  const cardId = typeof args.cardId === "string" ? args.cardId : undefined;
+  const data = {
+    uid,
+    agentId: AGENT_ID,
+    tool,
+    label: describeActivity(tool, args),
+    cardId: cardId ?? null,
+    startedAt: Date.now(),
+  };
+
+  const db = getRtdb();
+  await Promise.all(
+    agentWorkspaceIds.map(async (wsId) => {
+      const ref = rtdbRef(db, `${AGENT_ACTIVITY_ROOT}/${wsId}/${SESSION_ID}`);
+      try {
+        await rtdbSet(ref, data);
+        await onDisconnect(ref).remove();
+      } catch { /* best effort */ }
+    }),
+  );
+}
+
+async function clearAgentActivity(): Promise<void> {
+  if (agentWorkspaceIds.length === 0) return;
+  const db = getRtdb();
+  await Promise.all(
+    agentWorkspaceIds.map(async (wsId) => {
+      const ref = rtdbRef(db, `${AGENT_ACTIVITY_ROOT}/${wsId}/${SESSION_ID}`);
+      try { await rtdbRemove(ref); } catch { /* best effort */ }
+    }),
+  );
 }
 
 const PRESENCE_HEARTBEAT_MS = 30_000; // re-write presence every 30s
@@ -532,6 +619,42 @@ const server = new McpServer(
     },
   },
 );
+
+/* ------------------------------------------------------------------ */
+/*  Auto-instrument every registered tool with activity tracking.      */
+/*                                                                     */
+/*  Wrapping `registerTool` once here means every subsequent           */
+/*  registration (including the integration helper below) writes a     */
+/*  `agentActivity/{ws}/{session}` entry while the handler runs and    */
+/*  removes it when the handler resolves or rejects. The UI subscribes */
+/*  to that path and renders the current tool call as a small pill on  */
+/*  the agent's assigned card — closes ToDo's #117.                    */
+/* ------------------------------------------------------------------ */
+
+{
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const origRegisterTool = (server.registerTool as any).bind(server);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (server as any).registerTool = function instrumentedRegisterTool(
+    name: string,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    meta: any,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    handler: (args: any, extra: any) => Promise<any> | any,
+  ) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const wrapped = async (args: any, extra: any) => {
+      const argRecord = (args && typeof args === "object" ? args : {}) as Record<string, unknown>;
+      void writeAgentActivity(name, argRecord);
+      try {
+        return await handler(args, extra);
+      } finally {
+        void clearAgentActivity();
+      }
+    };
+    return origRegisterTool(name, meta, wrapped);
+  };
+}
 
 /* ── list_cards ─────────────────────────────────────────────────── */
 server.registerTool("list_cards", {
