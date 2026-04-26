@@ -189,6 +189,7 @@ function describeActivity(tool: string, args: Record<string, unknown>): string {
     case "update_card":        return "Updating card";
     case "update_card_settings": return "Updating card settings";
     case "delete_card":        return "Deleting card";
+    case "list_notes":         return "Listing notes";
     case "delete_note":        return "Deleting note";
     case "delete_task":        return `Deleting task ${num}`.trim();
     case "list_comments":      return "Listing comments";
@@ -1624,7 +1625,14 @@ registerWorkspaceTool("delete_card", "Delete Card",
     cardId:  z.string().describe("Card ID to delete"),
   }, false, true);
 
-/* ── Note + Task delete ────────────────────────────────────────── */
+/* ── Note list + delete ────────────────────────────────────────── */
+registerWorkspaceTool("list_notes", "List Notes",
+  "List notes on a board. Each entry includes id, title, color, hasEdges. Set orphansOnly=true to return only notes with no incoming/outgoing edges.",
+  {
+    boardId:     z.string().describe("Board ID"),
+    orphansOnly: z.boolean().optional().describe("Return only notes that have no edges (default: false)"),
+  }, true);
+
 registerWorkspaceTool("delete_note", "Delete Note",
   "Permanently delete a note from the canvas along with any edges connected to it.",
   {
