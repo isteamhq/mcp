@@ -1355,7 +1355,7 @@ server.registerTool("create_note", {
 /* ── update_note ────────────────────────────────────────────────── */
 server.registerTool("update_note", {
   title: "Update Note",
-  description: "Update an existing note's title, content, or color.",
+  description: "Update an existing note's title, content, color, or width (in canvas pixels).",
   inputSchema: {
     workspaceId: z.string().describe("Workspace ID"),
     boardId:     z.string().describe("Board ID"),
@@ -1363,6 +1363,7 @@ server.registerTool("update_note", {
     title:       z.string().optional().describe("New title"),
     content:     z.string().optional().describe("New content (markdown supported)"),
     color:       z.number().optional().describe("New color 0-5"),
+    width:       z.number().optional().describe("New width in pixels (100–1200). Sets style.width."),
   },
   annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
 }, async (args) => {
