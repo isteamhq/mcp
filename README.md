@@ -31,7 +31,7 @@ Add to your MCP config (`.mcp.json` or Claude Desktop settings):
 
 ## Tools
 
-**v3.0** ships **80 tools** total — 14 task/card primitives, 8 canvas, 22 workspace + collab, 21 workflow + niche, 1 meta, plus 34 integration tools (GitHub, Drive, Slack, Figma, Calendar). The full surface is grouped below.
+**v3.0** ships **~113 tools** total — task & card lifecycle (33), canvas (12), workspace primitives (9), team ops (6), sprints (5), niche (12), real-time/chat (5), plus 34 integration tools (GitHub, Drive, Slack, Figma, Calendar). The full surface is grouped below.
 
 ### Card & task essentials
 | Tool | Description |
@@ -56,7 +56,7 @@ Add to your MCP config (`.mcp.json` or Claude Desktop settings):
 ### Notes / canvas
 | Tool | Description |
 |------|-------------|
-| `create_note` / `update_note` / `delete_note` | Note CRUD |
+| `list_notes` / `create_note` / `update_note` / `delete_note` | Note CRUD (`orphansOnly` flag for cleanup) |
 | `create_edge` / `delete_edge` | Edge CRUD |
 | `create_stack` / `add_to_stack` / `dissolve_stack` | Note stacks |
 | `move_node` / `batch_move_nodes` / `batch_delete_nodes` | Single + bulk canvas ops |
