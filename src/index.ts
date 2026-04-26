@@ -190,6 +190,7 @@ function describeActivity(tool: string, args: Record<string, unknown>): string {
     case "update_card_settings": return "Updating card settings";
     case "delete_card":        return "Deleting card";
     case "list_notes":         return "Listing notes";
+    case "list_edges":         return "Listing edges";
     case "delete_note":        return "Deleting note";
     case "delete_task":        return `Deleting task ${num}`.trim();
     case "list_comments":      return "Listing comments";
@@ -1631,6 +1632,13 @@ registerWorkspaceTool("list_notes", "List Notes",
   {
     boardId:     z.string().describe("Board ID"),
     orphansOnly: z.boolean().optional().describe("Return only notes that have no edges (default: false)"),
+  }, true);
+
+registerWorkspaceTool("list_edges", "List Edges",
+  "List canvas edges on a board. Each entry: id, source, target, sourceHandle (top/right/bottom/left or null), targetHandle, label. Pass nodeId to filter to edges touching a single node.",
+  {
+    boardId: z.string().describe("Board ID"),
+    nodeId:  z.string().optional().describe("Optional — filter to edges where source==nodeId OR target==nodeId"),
   }, true);
 
 registerWorkspaceTool("delete_note", "Delete Note",
