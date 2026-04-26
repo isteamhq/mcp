@@ -180,6 +180,62 @@ function describeActivity(tool: string, args: Record<string, unknown>): string {
     case "subscribe_card":     return "Subscribing to card";
     case "unsubscribe_card":   return "Unsubscribing from card";
     case "list_integrations":  return "Checking integrations";
+    case "list_boards":        return "Listing boards";
+    case "create_board":       return `Creating board${title}`;
+    case "update_board":       return "Updating board";
+    case "delete_board":       return "Deleting board";
+    case "list_members":       return "Listing members";
+    case "create_card":        return `Creating card${title}`;
+    case "update_card":        return "Updating card";
+    case "update_card_settings": return "Updating card settings";
+    case "delete_card":        return "Deleting card";
+    case "delete_note":        return "Deleting note";
+    case "delete_task":        return `Deleting task ${num}`.trim();
+    case "list_comments":      return "Listing comments";
+    case "update_comment":     return "Updating comment";
+    case "delete_comment":     return "Deleting comment";
+    case "list_worklogs":      return "Listing worklogs";
+    case "get_worklog":        return "Reading worklog";
+    case "update_worklog":     return "Updating worklog";
+    case "delete_worklog":     return "Deleting worklog";
+    case "get_active_timer":   return "Reading active timer";
+    case "list_files":         return "Listing files";
+    case "delete_file":        return "Deleting file";
+    case "add_task_attachment":    return "Attaching file";
+    case "remove_task_attachment": return "Detaching file";
+    case "list_task_attachments":  return "Listing attachments";
+    case "invite_members":         return "Sending invites";
+    case "list_pending_invites":   return "Listing pending invites";
+    case "revoke_invite":          return "Revoking invite";
+    case "update_member_role":     return "Updating member role";
+    case "remove_member":          return "Removing member";
+    case "update_member_profile":  return "Updating member profile";
+    case "add_task_subscriber":    return "Adding subscriber";
+    case "remove_task_subscriber": return "Removing subscriber";
+    case "list_task_subscribers":  return "Listing subscribers";
+    case "create_sprint":          return `Creating sprint${title}`;
+    case "update_sprint":          return "Updating sprint";
+    case "complete_sprint":        return "Completing sprint";
+    case "list_sprints":           return "Listing sprints";
+    case "get_active_sprint":      return "Reading active sprint";
+    case "add_subtask":            return "Linking subtask";
+    case "remove_subtask":         return "Unlinking subtask";
+    case "list_subtasks":          return "Listing subtasks";
+    case "list_all_tasks":         return "Listing all tasks";
+    case "list_archived_tasks":    return "Listing archived tasks";
+    case "restore_task":           return `Restoring task ${num}`.trim();
+    case "list_notifications":     return "Listing notifications";
+    case "mark_notification_read": return "Marking notification read";
+    case "delete_notification":    return "Deleting notification";
+    case "list_forms":             return "Listing forms";
+    case "get_form":               return "Reading form";
+    case "list_form_submissions":  return "Listing form submissions";
+    case "get_workspace_settings": return "Reading workspace settings";
+    case "update_workspace_settings": return "Updating workspace settings";
+    case "get_user_preferences":   return "Reading user preferences";
+    case "update_user_preferences": return "Updating user preferences";
+    case "batch_move_nodes":       return "Batch-moving nodes";
+    case "batch_delete_nodes":     return "Batch-deleting nodes";
     default:                   return tool.replace(/_/g, " ");
   }
 }
@@ -610,7 +666,7 @@ const UnsubscribeCardSchema = {
 /* ------------------------------------------------------------------ */
 
 const server = new McpServer(
-  { name: "is.team", version: "2.1.0" },
+  { name: "is.team", version: "3.0.0" },
   {
     capabilities: {
       tools: {},
@@ -1442,6 +1498,525 @@ server.registerTool("unsubscribe_card", {
   const text = await performUnsubscribe(args.cardId);
   return { content: [{ type: "text" as const, text }] };
 });
+
+/* ================================================================== */
+/*  Workspace primitives — Board / Card / Member CRUD (v3 Sprint 1)    */
+/* ================================================================== */
+
+/** Helper for workspace-scoped primitive tools (no integration dispatch). */
+function registerWorkspaceTool(
+  name: string,
+  title: string,
+  description: string,
+  extraSchema: Record<string, z.ZodTypeAny>,
+  readOnly: boolean,
+  destructive = false,
+) {
+  server.registerTool(name, {
+    title,
+    description,
+    inputSchema: { ...WorkspaceIdArg, ...extraSchema },
+    annotations: { readOnlyHint: readOnly, destructiveHint: destructive, openWorldHint: false },
+  }, async (args) => {
+    const { workspaceId, ...rest } = args;
+    const result = await client.executeWorkspaceTool(name, workspaceId, rest);
+    return { content: [{ type: "text" as const, text: result }] };
+  });
+}
+
+/* ── Board CRUD ─────────────────────────────────────────────────── */
+registerWorkspaceTool("list_boards", "List Boards",
+  "List every board in a workspace that the caller can access. Owner sees all; members only see public + explicitly allowed boards.",
+  {}, true);
+
+registerWorkspaceTool("create_board", "Create Board",
+  "Create a new board in the workspace. Returns the new boardId. Visibility defaults to ALL (everyone in the workspace can see).",
+  {
+    name:       z.string().describe("Board name"),
+    icon:       z.string().optional().describe("Icon key (default: kanban)"),
+    visibility: z.enum(["all", "selected"]).optional().describe("ALL = open to all members; SELECTED = only allowedMembers"),
+  }, false);
+
+registerWorkspaceTool("update_board", "Update Board",
+  "Rename a board, change its icon/visibility/allowed-members, or set its budget. Only include fields you want to change.",
+  {
+    boardId:        z.string().describe("Board ID"),
+    name:           z.string().optional().describe("New name"),
+    icon:           z.string().optional().describe("New icon key"),
+    visibility:     z.enum(["all", "selected"]).optional().describe("Visibility — ALL or SELECTED"),
+    allowedMembers: z.array(z.string()).optional().describe("UIDs of members allowed when visibility=SELECTED"),
+    budgetAmount:   z.number().nullable().optional().describe("Budget amount, or null to clear"),
+    budgetType:     z.enum(["currency", "hours"]).nullable().optional().describe("Budget type, or null to clear"),
+  }, false);
+
+registerWorkspaceTool("delete_board", "Delete Board",
+  "Permanently delete a board AND every card/note/edge inside it. Owner only. This cannot be undone.",
+  {
+    boardId: z.string().describe("Board ID"),
+  }, false, true);
+
+/* ── Members ────────────────────────────────────────────────────── */
+registerWorkspaceTool("list_members", "List Members",
+  "List every workspace member with uid, email, displayName, role, jobTitle. Use the uid for assignee/autoAssignee/autoReporter on tasks and cards.",
+  {}, true);
+
+/* ── Card (taskColumn) CRUD ────────────────────────────────────── */
+registerWorkspaceTool("create_card", "Create Card",
+  "Create a new kanban card (column) on a board. The returned cardId/nodeId can be passed to subscribe_card or read_card.",
+  {
+    boardId:    z.string().describe("Board ID where the card will live"),
+    title:      z.string().describe("Card title (e.g. \"Backlog\", \"In Progress\")"),
+    icon:       z.string().optional().describe("Icon key"),
+    color:      z.number().optional().describe("Color index 0-9"),
+    position:   z.object({ x: z.number(), y: z.number() }).optional().describe("Canvas position; auto-randomized if omitted"),
+    llmAccess:  z.boolean().optional().describe("Allow AI agents to read this card (default: false)"),
+    llmFlow:    z.boolean().optional().describe("Allow AI agents to create/update tasks (default: false)"),
+    llmComment: z.boolean().optional().describe("Allow AI agents to comment on tasks (default: false)"),
+    llmContext: z.string().optional().describe("Free-form prompt context shown to AI agents on this card"),
+  }, false);
+
+registerWorkspaceTool("update_card", "Update Card",
+  "Rename a card or change its color/icon/AI access flags. Set llmContext to null to clear it.",
+  {
+    boardId:    z.string().describe("Board ID"),
+    cardId:     z.string().describe("Card ID (e.g. col-1773256154568)"),
+    title:      z.string().optional().describe("New title"),
+    icon:       z.string().nullable().optional().describe("Icon key, or null to clear"),
+    color:      z.number().nullable().optional().describe("Color index, or null to clear"),
+    llmAccess:  z.boolean().optional().describe("Toggle AI read access"),
+    llmFlow:    z.boolean().optional().describe("Toggle AI create/update access"),
+    llmComment: z.boolean().optional().describe("Toggle AI comment access"),
+    llmContext: z.string().nullable().optional().describe("AI prompt context, or null to clear"),
+  }, false);
+
+registerWorkspaceTool("update_card_settings", "Update Card Settings",
+  [
+    "Configure card automation rules: auto-assign, auto-reporter, auto-due-date, auto-archive, max-active-tasks,",
+    "auto-label, notify-on-enter, stale-task move, AI automation prompt. Pass uid for autoAssignee/autoReporter,",
+    "or null to clear. Only include fields you want to change.",
+  ].join(" "),
+  {
+    boardId:              z.string().describe("Board ID"),
+    cardId:               z.string().describe("Card ID"),
+    autoAssignee:         z.string().nullable().optional().describe("Member UID to auto-assign new tasks to, or null to clear"),
+    autoAssigneeOnDrop:   z.boolean().optional().describe("Reassign on drop, not just create"),
+    autoReporter:         z.string().nullable().optional().describe("Member UID to auto-set as reporter, or null to clear"),
+    autoReporterOnDrop:   z.boolean().optional().describe("Reset reporter on drop"),
+    autoDueDays:          z.number().nullable().optional().describe("Days from creation to set as due date, or null"),
+    autoDueDaysOnDrop:    z.boolean().optional().describe("Reset due date on drop"),
+    maxActiveTasks:       z.number().nullable().optional().describe("Max non-archived tasks before oldest auto-archives"),
+    autoArchive:          z.boolean().optional().describe("Auto-archive completed tasks after N days"),
+    autoArchiveDays:      z.number().nullable().optional().describe("Days before completed task auto-archives"),
+    autoComplete:         z.boolean().optional().describe("Mark tasks as completed when they enter this card"),
+    autoLabel:            z.string().nullable().optional().describe("Label string to auto-add on entry, or null"),
+    autoLabelColor:       z.string().nullable().optional().describe("Hex color for auto-label, or null"),
+    notifyOnEnter:        z.boolean().optional().describe("Notify assignee when their task enters this card"),
+    autoMoveStaleDays:    z.number().nullable().optional().describe("Auto-move tasks idle for N days, or null"),
+    autoMoveStaleTarget:  z.string().nullable().optional().describe("Target card ID for stale move, or null"),
+    aiAutomation:         z.boolean().optional().describe("Enable AI automation on tasks entering this card"),
+    aiAutomationPrompt:   z.string().nullable().optional().describe("Prompt evaluated for entering tasks, or null"),
+  }, false);
+
+registerWorkspaceTool("delete_card", "Delete Card",
+  "Permanently delete a card and every connected edge. Tasks inside the card are removed with it. Cannot be undone.",
+  {
+    boardId: z.string().describe("Board ID"),
+    cardId:  z.string().describe("Card ID to delete"),
+  }, false, true);
+
+/* ── Note + Task delete ────────────────────────────────────────── */
+registerWorkspaceTool("delete_note", "Delete Note",
+  "Permanently delete a note from the canvas along with any edges connected to it.",
+  {
+    boardId: z.string().describe("Board ID"),
+    noteId:  z.string().describe("Note ID (e.g. note-1773256154568)"),
+  }, false, true);
+
+registerWorkspaceTool("delete_task", "Delete Task",
+  "Permanently delete a single task from a card. To remove without losing history, prefer update_task with archived=true.",
+  {
+    boardId:    z.string().describe("Board ID containing the card"),
+    cardId:     z.string().describe("Card ID containing the task"),
+    taskNumber: zNum("Task number to delete"),
+  }, false, true);
+
+/* ================================================================== */
+/*  Collaboration — Comments / Worklog / Attachments (v3 Sprint 2)     */
+/* ================================================================== */
+
+/* ── Comments ──────────────────────────────────────────────────── */
+registerWorkspaceTool("list_comments", "List Comments",
+  "List comments on a task (newest first). Returns id, type, text, authorUid/Name, createdAt, mentionedUids.",
+  {
+    boardId:    z.string().describe("Board ID"),
+    cardId:     z.string().describe("Card ID"),
+    taskNumber: zNum("Task number"),
+    limit:      z.number().optional().describe("Max comments to return (default 20, max 100)"),
+  }, true);
+
+registerWorkspaceTool("update_comment", "Update Comment",
+  "Edit a comment's text. Author or workspace owner only. Activity-log entries cannot be edited.",
+  {
+    commentId: z.string().describe("Comment ID returned by list_comments or add_comment"),
+    text:      z.string().describe("New comment text (max 10000 chars)"),
+  }, false);
+
+registerWorkspaceTool("delete_comment", "Delete Comment",
+  "Permanently delete a comment. Author or workspace owner only.",
+  {
+    commentId: z.string().describe("Comment ID"),
+  }, false, true);
+
+/* ── Worklog ───────────────────────────────────────────────────── */
+registerWorkspaceTool("list_worklogs", "List Worklogs",
+  "List worklog entries with flexible filters: by task (boardId+cardId+taskNumber), by user (uid), or by date range (YYYY-MM-DD). Returns up to 20 newest by default.",
+  {
+    boardId:    z.string().optional().describe("Filter to one task — board ID"),
+    cardId:     z.string().optional().describe("Filter to one task — card ID"),
+    taskNumber: zNumOptional("Filter to one task — task number"),
+    uid:        z.string().optional().describe("Filter by member uid"),
+    dateFrom:   z.string().optional().describe("Inclusive start date (YYYY-MM-DD)"),
+    dateTo:     z.string().optional().describe("Inclusive end date (YYYY-MM-DD)"),
+    limit:      z.number().optional().describe("Max entries (default 20, max 100)"),
+  }, true);
+
+registerWorkspaceTool("get_worklog", "Get Worklog",
+  "Read a single worklog entry by ID.",
+  {
+    worklogId: z.string().describe("Worklog ID"),
+  }, true);
+
+registerWorkspaceTool("update_worklog", "Update Worklog",
+  "Edit a worklog's duration, description, or date. Worklog author or workspace owner only.",
+  {
+    worklogId:   z.string().describe("Worklog ID"),
+    duration:    z.number().optional().describe("Duration in seconds (60–86400, i.e. 1 min – 24 h)"),
+    description: z.string().optional().describe("New description (max 2000 chars)"),
+    date:        z.string().optional().describe("New date (YYYY-MM-DD)"),
+  }, false);
+
+registerWorkspaceTool("delete_worklog", "Delete Worklog",
+  "Permanently delete a worklog entry. Author or workspace owner only.",
+  {
+    worklogId: z.string().describe("Worklog ID"),
+  }, false, true);
+
+registerWorkspaceTool("get_active_timer", "Get Active Timer",
+  "Read the currently-running timer for a member. Omit uid to read the caller's own timer. Returns active=false if no timer is running.",
+  {
+    uid: z.string().optional().describe("Member uid (defaults to caller)"),
+  }, true);
+
+/* ── Files & Attachments ───────────────────────────────────────── */
+registerWorkspaceTool("list_files", "List Workspace Files",
+  "List files uploaded to the workspace's file library. Filter by mime category and/or name search. Returns id, name, mimeType, size, url.",
+  {
+    mimeFilter: z.enum(["image", "document"]).optional().describe("image = only images, document = everything else"),
+    search:     z.string().optional().describe("Substring match on file name"),
+    cursor:     z.string().optional().describe("Pagination cursor (file ID returned in previous page)"),
+    limit:      z.number().optional().describe("Page size (default 20, max 100)"),
+  }, true);
+
+registerWorkspaceTool("delete_file", "Delete File",
+  "Permanently delete a file from storage AND its Firestore record. Uploader or workspace owner only.",
+  {
+    fileId: z.string().describe("File ID"),
+  }, false, true);
+
+registerWorkspaceTool("add_task_attachment", "Add Task Attachment",
+  "Attach an existing workspace file to a task. The file ID must come from list_files.",
+  {
+    boardId:    z.string().describe("Board ID"),
+    cardId:     z.string().describe("Card ID"),
+    taskNumber: zNum("Task number"),
+    fileId:     z.string().describe("File ID from list_files"),
+  }, false);
+
+registerWorkspaceTool("remove_task_attachment", "Remove Task Attachment",
+  "Detach a file from a task. The underlying file is NOT deleted (use delete_file for that).",
+  {
+    boardId:      z.string().describe("Board ID"),
+    cardId:       z.string().describe("Card ID"),
+    taskNumber:   zNum("Task number"),
+    attachmentId: z.string().describe("Attachment ID (== file ID)"),
+  }, false);
+
+registerWorkspaceTool("list_task_attachments", "List Task Attachments",
+  "List files attached to a task. Returns id, name, mimeType, size, url for each attachment.",
+  {
+    boardId:    z.string().describe("Board ID"),
+    cardId:     z.string().describe("Card ID"),
+    taskNumber: zNum("Task number"),
+  }, true);
+
+/* ================================================================== */
+/*  Team Ops — Members / Invites / Subscribers (v3 Sprint 3)           */
+/* ================================================================== */
+
+/* ── Invites ───────────────────────────────────────────────────── */
+registerWorkspaceTool("invite_members", "Invite Members",
+  [
+    "Send workspace invitations by email. Each invite creates a pending Firestore doc, sends an email,",
+    "and (if the user already has an account) writes an in-app notification. Provide an array of",
+    "{ email, jobTitle?, role? } objects. Only owners can invite as 'owner'. Seat limits are enforced.",
+  ].join(" "),
+  {
+    invites: z.array(z.object({
+      email:    z.string().describe("Recipient email"),
+      jobTitle: z.string().nullable().optional().describe("Optional job title to attach to the invite"),
+      role:     z.enum(["owner", "member"]).optional().describe("Role to grant on accept (default: member)"),
+    })).describe("One or more invitations to send"),
+  }, false);
+
+registerWorkspaceTool("list_pending_invites", "List Pending Invites",
+  "List unaccepted/unrevoked invites for the workspace. Returns token, email, role, jobTitle, invitedBy, expiresAt.",
+  {}, true);
+
+registerWorkspaceTool("revoke_invite", "Revoke Invite",
+  "Mark a pending invite as revoked so the link can no longer be accepted. Owner only.",
+  {
+    token: z.string().describe("Invite token (also the doc ID)"),
+  }, false, true);
+
+/* ── Member ops ────────────────────────────────────────────────── */
+registerWorkspaceTool("update_member_role", "Update Member Role",
+  "Promote a member to owner, or demote an owner to member. Last-owner protection prevents demotion if no other owner exists. Owner only.",
+  {
+    targetUid: z.string().describe("Target member UID"),
+    newRole:   z.enum(["owner", "member"]).describe("New role"),
+  }, false);
+
+registerWorkspaceTool("remove_member", "Remove Member",
+  "Remove a member from the workspace. Last-owner protection enforced. Cannot remove yourself (use leave_workspace). Owner only.",
+  {
+    targetUid: z.string().describe("Target member UID"),
+  }, false, true);
+
+registerWorkspaceTool("update_member_profile", "Update Member Profile",
+  "Edit a member's jobTitle (self or owner) or hourlyRate (owner only — sensitive data).",
+  {
+    targetUid:  z.string().describe("Target UID — must equal caller UID for self-edit, or caller must be owner"),
+    jobTitle:   z.string().nullable().optional().describe("New job title, or null to clear"),
+    hourlyRate: z.number().nullable().optional().describe("New hourly rate (workspace currency, owner only), or null to clear"),
+  }, false);
+
+/* ── Task subscribers ─────────────────────────────────────────── */
+registerWorkspaceTool("add_task_subscriber", "Add Task Subscriber",
+  "Add a workspace member as a subscriber on a task — they'll receive notifications when the task is updated, commented on, etc.",
+  {
+    boardId:    z.string().describe("Board ID"),
+    cardId:     z.string().describe("Card ID"),
+    taskNumber: zNum("Task number"),
+    uid:        z.string().describe("Member UID to subscribe"),
+  }, false);
+
+registerWorkspaceTool("remove_task_subscriber", "Remove Task Subscriber",
+  "Remove a member from a task's subscriber list.",
+  {
+    boardId:    z.string().describe("Board ID"),
+    cardId:     z.string().describe("Card ID"),
+    taskNumber: zNum("Task number"),
+    uid:        z.string().describe("Member UID to unsubscribe"),
+  }, false);
+
+registerWorkspaceTool("list_task_subscribers", "List Task Subscribers",
+  "List members currently subscribed to a task. Returns uid + displayName + email for each.",
+  {
+    boardId:    z.string().describe("Board ID"),
+    cardId:     z.string().describe("Card ID"),
+    taskNumber: zNum("Task number"),
+  }, true);
+
+/* ================================================================== */
+/*  Workflow — Sprints / Subtasks / Archive (v3 Sprint 4)              */
+/* ================================================================== */
+
+/* ── Sprints ──────────────────────────────────────────────────── */
+registerWorkspaceTool("create_sprint", "Create Sprint",
+  "Create a sprint on a board with name, startDate (YYYY-MM-DD), endDate, and optional goal. Default status is PLANNING. Max duration 90 days.",
+  {
+    boardId:   z.string().describe("Board ID"),
+    name:      z.string().describe("Sprint name"),
+    startDate: z.string().describe("Start date (YYYY-MM-DD)"),
+    endDate:   z.string().describe("End date (YYYY-MM-DD)"),
+    goal:      z.string().optional().describe("Sprint goal / theme"),
+    status:    z.enum(["PLANNING", "ACTIVE", "COMPLETED"]).optional().describe("Initial status (default: PLANNING)"),
+  }, false);
+
+registerWorkspaceTool("update_sprint", "Update Sprint",
+  "Update sprint name, dates, status (PLANNING → ACTIVE → COMPLETED), or goal. Set goal to null to clear.",
+  {
+    boardId:   z.string().describe("Board ID"),
+    sprintId:  z.string().describe("Sprint ID"),
+    name:      z.string().optional().describe("New name"),
+    goal:      z.string().nullable().optional().describe("New goal, or null to clear"),
+    startDate: z.string().optional().describe("New start (YYYY-MM-DD)"),
+    endDate:   z.string().optional().describe("New end (YYYY-MM-DD)"),
+    status:    z.enum(["PLANNING", "ACTIVE", "COMPLETED"]).optional().describe("New status"),
+  }, false);
+
+registerWorkspaceTool("complete_sprint", "Complete Sprint",
+  "Mark a sprint as completed and snapshot its metrics (totalTasks, completedTasks, totalStoryPoints, completedStoryPoints, carriedOverTaskIds).",
+  {
+    boardId:  z.string().describe("Board ID"),
+    sprintId: z.string().describe("Sprint ID"),
+  }, false);
+
+registerWorkspaceTool("list_sprints", "List Sprints",
+  "List all sprints on a board, newest first. Returns id, name, dates, status, snapshot (if completed).",
+  {
+    boardId: z.string().describe("Board ID"),
+  }, true);
+
+registerWorkspaceTool("get_active_sprint", "Get Active Sprint",
+  "Return the currently ACTIVE sprint on a board, or { active: false } if none.",
+  {
+    boardId: z.string().describe("Board ID"),
+  }, true);
+
+/* ── Subtasks ─────────────────────────────────────────────────── */
+registerWorkspaceTool("add_subtask", "Link Task as Subtask",
+  "Link two tasks in a parent ↔ child relationship. The child's parentTask is set; the parent's subtaskRefs array gains the child. Tasks may live on the same or different cards on the same board.",
+  {
+    boardId:          z.string().describe("Board ID containing both tasks"),
+    parentCardId:     z.string().describe("Card ID of the parent task"),
+    parentTaskNumber: zNum("Parent task number"),
+    childCardId:      z.string().describe("Card ID of the child (subtask) task"),
+    childTaskNumber:  zNum("Child task number"),
+  }, false);
+
+registerWorkspaceTool("remove_subtask", "Unlink Subtask",
+  "Reverse of add_subtask — removes the child's parentTask field and prunes the parent's subtaskRefs entry.",
+  {
+    boardId:          z.string().describe("Board ID"),
+    parentCardId:     z.string().describe("Card ID of the parent"),
+    parentTaskNumber: zNum("Parent task number"),
+    childCardId:      z.string().describe("Card ID of the child"),
+    childTaskNumber:  zNum("Child task number"),
+  }, false);
+
+registerWorkspaceTool("list_subtasks", "List Subtasks",
+  "Show a task's parent (parentTask) and children (subtaskRefs). Useful for traversing dependency chains.",
+  {
+    boardId:    z.string().describe("Board ID"),
+    cardId:     z.string().describe("Card ID"),
+    taskNumber: zNum("Task number"),
+  }, true);
+
+/* ── Archive ──────────────────────────────────────────────────── */
+registerWorkspaceTool("list_all_tasks", "List All Tasks (incl. archived)",
+  "List every task on a card. Set includeArchived=true to also return archived tasks (default: active only). Returns compact rows.",
+  {
+    boardId:         z.string().describe("Board ID"),
+    cardId:          z.string().describe("Card ID"),
+    includeArchived: z.boolean().optional().describe("Include archived tasks (default: false)"),
+  }, true);
+
+registerWorkspaceTool("list_archived_tasks", "List Archived Tasks",
+  "List ONLY archived tasks on a card.",
+  {
+    boardId: z.string().describe("Board ID"),
+    cardId:  z.string().describe("Card ID"),
+  }, true);
+
+registerWorkspaceTool("restore_task", "Restore Task",
+  "Set archived=false on a task so it shows in the active list again.",
+  {
+    boardId:    z.string().describe("Board ID"),
+    cardId:     z.string().describe("Card ID"),
+    taskNumber: zNum("Task number"),
+  }, false);
+
+/* ================================================================== */
+/*  Niche tools (v3 Sprint 5)                                          */
+/* ================================================================== */
+
+/* ── Notifications ─────────────────────────────────────────────── */
+registerWorkspaceTool("list_notifications", "List Notifications",
+  "Read the caller's own notifications, newest first. Default returns unread only.",
+  {
+    limit:       z.number().optional().describe("Max items (default 20, max 100)"),
+    includeRead: z.boolean().optional().describe("Include read notifications (default: false)"),
+  }, true);
+
+registerWorkspaceTool("mark_notification_read", "Mark Notification Read",
+  "Mark a single notification as read. Caller must be the recipient.",
+  {
+    notificationId: z.string().describe("Notification ID"),
+  }, false);
+
+registerWorkspaceTool("delete_notification", "Delete Notification",
+  "Permanently delete a notification. Caller must be the recipient.",
+  {
+    notificationId: z.string().describe("Notification ID"),
+  }, false, true);
+
+/* ── Forms (read-only) ─────────────────────────────────────────── */
+registerWorkspaceTool("list_forms", "List Forms",
+  "List forms in the workspace. Filter by board (boardId) or card (cardNodeId) optionally. Returns form metadata and submission counts.",
+  {
+    boardId:    z.string().optional().describe("Filter by board ID"),
+    cardNodeId: z.string().optional().describe("Filter by card node ID"),
+  }, true);
+
+registerWorkspaceTool("get_form", "Get Form",
+  "Read full form definition: title, fields, settings, submissionCount.",
+  {
+    formId: z.string().describe("Form ID"),
+  }, true);
+
+registerWorkspaceTool("list_form_submissions", "List Form Submissions",
+  "List submissions for a form with pagination cursor.",
+  {
+    formId: z.string().describe("Form ID"),
+    limit:  z.number().optional().describe("Max items (default 20, max 100)"),
+    cursor: z.string().optional().describe("Pagination cursor (submission ID from previous page)"),
+  }, true);
+
+/* ── Workspace settings ────────────────────────────────────────── */
+registerWorkspaceTool("get_workspace_settings", "Get Workspace Settings",
+  "Read workspace name, timezone, currency, hoursPerDay, plan, storage usage.",
+  {}, true);
+
+registerWorkspaceTool("update_workspace_settings", "Update Workspace Settings",
+  "Update workspace metadata (name, timezone, currency, hoursPerDay). Owner only.",
+  {
+    name:        z.string().optional().describe("New workspace name"),
+    timezone:    z.string().optional().describe("IANA timezone (e.g. \"Europe/Istanbul\")"),
+    currency:    z.string().optional().describe("ISO currency code (e.g. \"USD\", \"TRY\")"),
+    hoursPerDay: z.number().optional().describe("Working hours per day (1–24)"),
+  }, false);
+
+/* ── User preferences ──────────────────────────────────────────── */
+registerWorkspaceTool("get_user_preferences", "Get User Preferences",
+  "Read the caller's own preferences: timezone, emailNotifications, canvasSettings.",
+  {}, true);
+
+registerWorkspaceTool("update_user_preferences", "Update User Preferences",
+  "Update the caller's own preferences. emailNotifications keys: invite_received, invite_accepted, member_removed, comment_added, mentioned, due_date_reminder, daily_board_digest, daily_planning.",
+  {
+    timezone:           z.string().optional().describe("IANA timezone string"),
+    emailNotifications: z.record(z.string(), z.boolean()).optional().describe("Partial email notification toggle map"),
+    canvasSettings:     z.record(z.string(), z.unknown()).optional().describe("Partial canvas settings (gridSize, snapToGrid, edgeAnimation, …)"),
+  }, false);
+
+/* ── Canvas batch ops ──────────────────────────────────────────── */
+registerWorkspaceTool("batch_move_nodes", "Batch Move Nodes",
+  "Move many canvas nodes (cards/notes/stacks) on a board in one call. Pass positions = { nodeId: { x, y }, … }. Max 200 nodes per call.",
+  {
+    boardId:   z.string().describe("Board ID"),
+    positions: z.record(z.string(), z.object({
+      x: z.number(),
+      y: z.number(),
+    })).describe("Map of nodeId → { x, y } new position"),
+  }, false);
+
+registerWorkspaceTool("batch_delete_nodes", "Batch Delete Nodes",
+  "Delete many canvas nodes in one call (cards/notes/stacks) and any edges connected to them. Max 200 nodes per call. Cannot be undone.",
+  {
+    boardId: z.string().describe("Board ID"),
+    nodeIds: z.array(z.string()).describe("Array of node IDs to delete"),
+  }, false, true);
 
 /* ------------------------------------------------------------------ */
 /*  Start                                                              */

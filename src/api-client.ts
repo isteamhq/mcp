@@ -72,9 +72,11 @@ export class IsTeamClient {
     return this.executeTool("ask_chat", cardId, { question, type, ...(options?.length ? { options } : {}) });
   }
 
-  /* ── Workspace-scoped integration tools ────────────────────────── */
+  /* ── Workspace-scoped tools (integrations, board/card/member CRUD…) ─ */
 
-  async executeIntegrationTool(tool: string, workspaceId: string, args?: Record<string, unknown>): Promise<string> {
+  /** Generic workspace-scoped tool call — used by every tool that takes a
+   *  workspaceId rather than a cardId (integrations + Sprint 1+ primitives). */
+  async executeWorkspaceTool(tool: string, workspaceId: string, args?: Record<string, unknown>): Promise<string> {
     const res = await fetch(`${this.baseUrl}/api/mcp/exec`, {
       method: "POST",
       headers: {
@@ -86,7 +88,12 @@ export class IsTeamClient {
     return res.text();
   }
 
+  /** @deprecated use executeWorkspaceTool — kept for back-compat. */
+  async executeIntegrationTool(tool: string, workspaceId: string, args?: Record<string, unknown>): Promise<string> {
+    return this.executeWorkspaceTool(tool, workspaceId, args);
+  }
+
   async listIntegrations(workspaceId: string): Promise<string> {
-    return this.executeIntegrationTool("list_integrations", workspaceId);
+    return this.executeWorkspaceTool("list_integrations", workspaceId);
   }
 }

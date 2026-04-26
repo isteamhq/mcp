@@ -31,19 +31,69 @@ Add to your MCP config (`.mcp.json` or Claude Desktop settings):
 
 ## Tools
 
+**v3.0** ships **80 tools** total — 14 task/card primitives, 8 canvas, 22 workspace + collab, 21 workflow + niche, 1 meta, plus 34 integration tools (GitHub, Drive, Slack, Figma, Calendar). The full surface is grouped below.
+
+### Card & task essentials
 | Tool | Description |
 |------|-------------|
-| `list_cards` | List all cards with LLM access enabled |
+| `list_cards` | List cards with LLM access enabled |
 | `read_card` | Read card content — tasks, details, connected cards |
-| `create_task` | Create a new task in a card |
-| `update_task` | Update task properties |
-| `complete_task` | Mark a task as done |
-| `move_task` | Move a task to a connected card |
-| `add_comment` | Add a comment to a task |
-| `log_time` | Record a worklog entry on a task |
-| `reorder_tasks` | Reorder tasks within a card |
-| `subscribe_card` | Get real-time notifications when new tasks appear |
-| `unsubscribe_card` | Stop listening to a card |
+| `create_task` / `update_task` / `complete_task` / `move_task` / `delete_task` | Task lifecycle |
+| `reorder_tasks` / `restore_task` | Re-order tasks; un-archive a task |
+| `add_comment` / `update_comment` / `delete_comment` / `list_comments` | Comment CRUD |
+| `log_time` / `list_worklogs` / `get_worklog` / `update_worklog` / `delete_worklog` / `get_active_timer` | Worklog & timer |
+| `add_task_attachment` / `remove_task_attachment` / `list_task_attachments` | File attachments |
+| `add_task_subscriber` / `remove_task_subscriber` / `list_task_subscribers` | Watchers |
+| `add_subtask` / `remove_subtask` / `list_subtasks` | Subtask hierarchy |
+| `list_all_tasks` / `list_archived_tasks` | Cross-section task listing |
+
+### Boards & cards (canvas columns)
+| Tool | Description |
+|------|-------------|
+| `list_boards` / `create_board` / `update_board` / `delete_board` | Board CRUD |
+| `create_card` / `update_card` / `update_card_settings` / `delete_card` | Card CRUD + automation rules (autoAssignee, autoLabel, aiAutomationPrompt, …) |
+
+### Notes / canvas
+| Tool | Description |
+|------|-------------|
+| `create_note` / `update_note` / `delete_note` | Note CRUD |
+| `create_edge` / `delete_edge` | Edge CRUD |
+| `create_stack` / `add_to_stack` / `dissolve_stack` | Note stacks |
+| `move_node` / `batch_move_nodes` / `batch_delete_nodes` | Single + bulk canvas ops |
+
+### Workspace / team
+| Tool | Description |
+|------|-------------|
+| `list_members` / `update_member_role` / `remove_member` / `update_member_profile` | Member ops |
+| `invite_members` / `list_pending_invites` / `revoke_invite` | Invitations |
+| `get_workspace_settings` / `update_workspace_settings` | Workspace metadata |
+| `get_user_preferences` / `update_user_preferences` | Caller's prefs (timezone, email, canvas) |
+| `list_files` / `delete_file` | Workspace file library |
+
+### Sprints (agile flow)
+| Tool | Description |
+|------|-------------|
+| `create_sprint` / `update_sprint` / `complete_sprint` | Sprint lifecycle (with snapshot) |
+| `list_sprints` / `get_active_sprint` | Read sprints |
+
+### Forms (read-only)
+| Tool | Description |
+|------|-------------|
+| `list_forms` / `get_form` / `list_form_submissions` | Inspect forms + submissions |
+
+### Notifications
+| Tool | Description |
+|------|-------------|
+| `list_notifications` / `mark_notification_read` / `delete_notification` | Caller's notification feed |
+
+### Real-time + chat
+| Tool | Description |
+|------|-------------|
+| `subscribe_card` / `unsubscribe_card` | Real-time card watcher |
+| `chat_respond` / `chat_history` / `ask_chat` | Card AI chat |
+
+### Integrations (34 tools)
+GitHub (12), Google Drive (8), Slack (7), Figma (3), Google Calendar (5). See `list_integrations`.
 
 ## Real-time notifications
 
