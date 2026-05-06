@@ -248,19 +248,35 @@ function describeActivity(tool: string, args: Record<string, unknown>): string {
  * indicator on the assigned card. Best-effort — failures don't surface
  * to the tool result.
  */
-async function writeAgentActivity(tool: string, args: Record<string, unknown>): Promise<void> {
+/**
+ * Write the agent's current state to RTDB so the UI can render a live
+ * "what's the agent doing right now" indicator. State machine:
+ *   - "thinking"  : message received, claude is reasoning, no tool call yet
+ *   - "tool"      : claude invoked a registered tool — `tool` + `label` describe it
+ *   - (cleared)   : nothing in flight; UI should show idle
+ *
+ * Best-effort writes — failures don't surface to the tool result.
+ */
+type ActivityState = "thinking" | "tool";
+
+async function writeAgentActivity(
+  tool: string,
+  args: Record<string, unknown>,
+  opts: { state?: ActivityState; cardId?: string; label?: string } = {},
+): Promise<void> {
   if (!firebaseAuthenticated) return;
   const uid = getAuthUid();
   if (!uid) return;
   if (agentWorkspaceIds.length === 0) return;
 
-  const cardId = typeof args.cardId === "string" ? args.cardId : undefined;
+  const cardId = opts.cardId ?? (typeof args.cardId === "string" ? args.cardId : undefined);
   const data = {
     uid,
     agentId: AGENT_ID,
+    state:   opts.state ?? "tool",
     tool,
-    label: describeActivity(tool, args),
-    cardId: cardId ?? null,
+    label:   opts.label ?? describeActivity(tool, args),
+    cardId:  cardId ?? null,
     startedAt: Date.now(),
   };
 
@@ -274,6 +290,15 @@ async function writeAgentActivity(tool: string, args: Record<string, unknown>): 
       } catch { /* best effort */ }
     }),
   );
+}
+
+/**
+ * Mark "claude received a chat message and is now reasoning" — the gap
+ * between message receipt and the first tool call. Without this entry the
+ * UI shows nothing while claude is composing its response, looks frozen.
+ */
+async function markThinking(cardId: string, label: string): Promise<void> {
+  await writeAgentActivity("__thinking__", {}, { state: "thinking", cardId, label });
 }
 
 async function clearAgentActivity(): Promise<void> {
@@ -690,6 +715,20 @@ const server = new McpServer(
 /* ------------------------------------------------------------------ */
 
 {
+  // Debounced clear: cancel-and-rearm a 5s timer after every tool call.
+  // Without this, a rapid sequence of tool calls (claude often does Read →
+  // Edit → Bash → chat_respond in <100 ms) flickers the pill empty between
+  // each one. With debounce, the pill smoothly transitions across tool
+  // labels and only goes blank ~5 s after claude truly stops.
+  let pendingClear: ReturnType<typeof setTimeout> | null = null;
+  const armClear = () => {
+    if (pendingClear) clearTimeout(pendingClear);
+    pendingClear = setTimeout(() => {
+      pendingClear = null;
+      void clearAgentActivity();
+    }, 5000);
+  };
+
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const origRegisterTool = (server.registerTool as any).bind(server);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -704,10 +743,12 @@ const server = new McpServer(
     const wrapped = async (args: any, extra: any) => {
       const argRecord = (args && typeof args === "object" ? args : {}) as Record<string, unknown>;
       void writeAgentActivity(name, argRecord);
+      // Cancel any in-flight clear — we're not idle, we're in another tool.
+      if (pendingClear) { clearTimeout(pendingClear); pendingClear = null; }
       try {
         return await handler(args, extra);
       } finally {
-        void clearAgentActivity();
+        armClear();
       }
     };
     return origRegisterTool(name, meta, wrapped);
@@ -864,6 +905,214 @@ server.registerTool("ask_chat", {
   const result = await client.askChat(args.cardId, args.question, args.type, args.options);
   return { content: [{ type: "text" as const, text: result }] };
 });
+
+/* ================================================================== */
+/*  Agent-action UI cards                                              */
+/*                                                                     */
+/*  Each tool below pushes a structured card into the card chat        */
+/*  rendered by `components/dashboard/chat-message.tsx`. Use them      */
+/*  INSTEAD of plain markdown when the situation matches — they let    */
+/*  non-technical users click instead of read.                         */
+/*                                                                     */
+/*  All tools share the same wire format: `content` is a short         */
+/*  human-readable line shown above the widget; `payload` is the       */
+/*  card-specific structured data.                                     */
+/* ================================================================== */
+
+/** Register a single agent-action card tool. Schemas vary per type so we
+ *  don't try to share a base schema — each registration documents the
+ *  fields the LLM should pass. */
+function registerAgentAction(
+  name: string,
+  title: string,
+  description: string,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  payloadSchema: Record<string, any>,
+): void {
+  server.registerTool(name, {
+    title,
+    description,
+    inputSchema: {
+      ...CardIdArg,
+      content: z.string().describe("Short human-readable line shown above the card (1–2 sentences max)"),
+      payload: z.object(payloadSchema).describe("Structured data for the card widget"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+  }, async (args) => {
+    const result = await client.agentAction(name, args.cardId, args.content, args.payload as Record<string, unknown>);
+    return { content: [{ type: "text" as const, text: result }] };
+  });
+}
+
+/* ── Persistence offers ──────────────────────────────────────────── */
+registerAgentAction(
+  "offer_drive_save",
+  "Offer to Save to Google Drive",
+  "Render an interactive card asking the user whether to save a document/note to Google Drive (so it survives the container being shut down). Use this WHEN you've produced a research summary, meeting notes, brief, or any non-code artifact the user might want to keep. Call this BEFORE actually uploading — the card is the user's consent. Wait for their reply.",
+  {
+    what:      z.string().describe("What you're offering to save (e.g. 'meeting notes', 'research summary')"),
+    fileName:  z.string().optional().describe("Suggested file name (with extension)"),
+    mimeType:  z.string().optional().describe("Suggested mime type (e.g. 'text/markdown')"),
+  },
+);
+
+registerAgentAction(
+  "offer_github_push",
+  "Offer to Push to GitHub",
+  "Render an interactive card asking the user whether to push the current code project to GitHub. Use this AFTER you've built or significantly changed code in /workspace and the user might want a permanent backup. Call this BEFORE actually pushing — the card is the user's consent. Wait for their reply.",
+  {
+    projectPath:       z.string().describe("Absolute path of the project (e.g. '/workspace/app')"),
+    suggestedRepoName: z.string().describe("kebab-case repo name suggestion"),
+    summary:           z.string().describe("One-sentence project summary used as repo description"),
+  },
+);
+
+/* ── Integration prompts ─────────────────────────────────────────── */
+registerAgentAction(
+  "prompt_integration_connect",
+  "Prompt to Connect an Integration",
+  "Render a card with a one-click 'Connect <provider>' button when an integration the user needs (GitHub, Google Drive, Slack, Figma, Calendar) is NOT yet connected. Use this when offer_drive_save / offer_github_push fail because the integration is missing, OR when the user asks for something that requires an integration they don't have.",
+  {
+    provider: z.enum(["github", "drive", "slack", "figma", "calendar"]).describe("Which integration the user needs to connect"),
+    reason:   z.string().describe("Why you need this integration in 1 sentence (rendered to the user)"),
+  },
+);
+
+registerAgentAction(
+  "check_existing_repo",
+  "Ask How to Handle an Existing Repo",
+  "Render a card asking the user how to handle a GitHub repo name that already exists. Options: use the existing repo, create with a new name, force-push (destructive). Use this WHEN you've already detected the suggested name is taken (via github_search_repos / github_get_file). Wait for their reply before acting.",
+  {
+    repoName:               z.string().describe("The repo name that's already taken"),
+    existingUrl:            z.string().optional().describe("Public URL of the existing repo, if found"),
+    suggestedAlternative:   z.string().optional().describe("A free alternative name to suggest"),
+  },
+);
+
+/* ── Preview & shipping ──────────────────────────────────────────── */
+registerAgentAction(
+  "share_preview",
+  "Share a Preview Link",
+  "Render a rich preview card for a project's public URL (live website / demo). Always use this INSTEAD of pasting a raw https://...fly.dev URL into chat — the card shows project name, status pill, an Open button. NEVER paste raw fly.dev URLs as plain text.",
+  {
+    projectName: z.string().describe("Display name of the project (e.g. 'Hesap Makinesi')"),
+    url:         z.string().describe("Full https:// URL of the live preview"),
+    status:      z.enum(["live", "building", "down"]).describe("Current state of the deployment"),
+    description: z.string().optional().describe("Short description rendered under the project name"),
+  },
+);
+
+registerAgentAction(
+  "list_projects",
+  "List Running Projects in This Container",
+  "Render a card listing all projects currently running in this container (one row per subdir under /workspace/projects/), each with its preview URL and status. Use this WHEN the user asks 'what's running?' or you manage multiple sub-apps in one container.",
+  {
+    projects: z.array(z.object({
+      name:   z.string(),
+      url:    z.string(),
+      status: z.enum(["live", "building", "down"]),
+      port:   z.number().optional(),
+    })).describe("Array of projects with their URLs"),
+  },
+);
+
+/* ── Guidance & planning ─────────────────────────────────────────── */
+registerAgentAction(
+  "task_plan",
+  "Show or Update a Task Plan",
+  "Render (and later UPDATE) a multi-step plan with live checkboxes. Use this WHEN the user asks for a non-trivial build (>3 steps): create the card up front so they see the full plan, then call task_plan again with the SAME planId and updated `steps[].state` to flip checkboxes as you work. The previous card is replaced in-place.",
+  {
+    planId: z.string().describe("Stable id for this plan (use the same value across all updates)"),
+    title:  z.string().describe("Short plan title (e.g. 'Hesap makinesi inşası')"),
+    steps:  z.array(z.object({
+      label: z.string(),
+      state: z.enum(["pending", "running", "done", "error"]),
+    })).describe("Ordered steps; flip state as you work"),
+  },
+);
+
+registerAgentAction(
+  "propose_design_choice",
+  "Propose a Visual Design Choice",
+  "Render a card with side-by-side visual options (theme, color palette, layout). Each option has a label, optional preview image URL, and a value the user picks. Use this INSTEAD of a markdown bullet list when the choice is visual.",
+  {
+    question: z.string().describe("The question shown above the options"),
+    options:  z.array(z.object({
+      label:      z.string(),
+      previewUrl: z.string().optional(),
+      value:      z.string(),
+    })).describe("Choices the user clicks one of"),
+  },
+);
+
+registerAgentAction(
+  "project_summary",
+  "Show a Final Project Summary",
+  "Render the final delivery card for a completed project: name, description, live URL, optional GitHub repo URL, and quick-action buttons (Open, View code, Edit, Start new). Use this AFTER the user confirms they're happy with the build.",
+  {
+    projectName: z.string(),
+    description: z.string(),
+    url:         z.string().optional().describe("Live preview URL (omit if no live demo)"),
+    repoUrl:     z.string().optional().describe("GitHub repository URL"),
+    actions:     z.array(z.string()).optional().describe("Optional list of quick-action button labels"),
+  },
+);
+
+registerAgentAction(
+  "propose_next_step",
+  "Suggest a Next Step",
+  "Render a 'shall we also …?' card after delivering something — single or two suggested follow-ups the user can click to start. Use this to gently extend the session without forcing the user to think of next steps.",
+  {
+    suggestions: z.array(z.object({
+      label: z.string(),
+      value: z.string(),
+    })).describe("Up to 3 suggested follow-up actions"),
+  },
+);
+
+registerAgentAction(
+  "confirm_destructive",
+  "Confirm a Destructive Action",
+  "Render a red, friction-heavy confirmation card BEFORE any irreversible action (delete repo, drop database, force-push to main, wipe /workspace). Optional `requireType` field demands the user re-type a specific string to proceed.",
+  {
+    action:      z.string().describe("Short label of the action (e.g. 'Delete repository my-project')"),
+    danger:      z.string().describe("One-sentence explanation of what could go wrong"),
+    requireType: z.string().optional().describe("If set, user must type this exact string to confirm"),
+  },
+);
+
+/* ── IO (asks & async) ───────────────────────────────────────────── */
+registerAgentAction(
+  "request_secret",
+  "Request a Secret from the User",
+  "Render a masked-input card to collect an API key, password, or token from the user. The value is forwarded back to the agent through the card chat as a special user message and ALSO written to a sealed /workspace/.env entry. Use this WHEN a project needs a secret to run (OpenAI key, Stripe key, …). NEVER ask for secrets in plain markdown.",
+  {
+    fieldName: z.string().describe("Env var key (e.g. 'OPENAI_API_KEY')"),
+    label:     z.string().describe("Friendly label rendered to the user"),
+    hint:      z.string().optional().describe("Optional hint about where to find it"),
+  },
+);
+
+registerAgentAction(
+  "request_image",
+  "Request an Image Upload",
+  "Render a card prompting the user to upload an image (logo, screenshot to mimic, profile picture, …). Use this when a project needs an asset you can't generate. The user's upload becomes a file in /workspace/uploads/.",
+  {
+    hint:   z.string().describe("What you need (e.g. 'logo image, png or svg, ≤2 MB')"),
+    accept: z.array(z.string()).optional().describe("Allowed mime-types (defaults to image/*)"),
+  },
+);
+
+registerAgentAction(
+  "show_log",
+  "Share a Build Log (Collapsible)",
+  "Render a collapsible log card containing technical output (Bash output, build errors, test results). Hidden by default behind a 'Show details' toggle. Use this WHEN you want to surface technical detail without scaring non-technical users with a wall of text.",
+  {
+    title: z.string().describe("Short label (e.g. 'npm install output', 'Build errors')"),
+    log:   z.string().describe("Raw log text — markdown is NOT rendered, monospace formatting"),
+    level: z.enum(["info", "warn", "error"]).optional().describe("Visual severity (defaults to info)"),
+  },
+);
 
 /* ================================================================== */
 /*  Workspace-scoped Integration Tools                                 */
@@ -1254,6 +1503,11 @@ async function performSubscribe(cardId: string, workspaceId: string, boardId: st
     }
 
     process.stderr.write(`[mcp] Chat message from ${senderName} on ${cardId}: ${content.slice(0, 80)}${attachmentLines.length > 0 ? ` [+${attachments!.length} files]` : ""}...\n`);
+
+    // Mark "thinking" *before* pushing the notification so the UI shows live
+    // status the instant the user's message lands, instead of a 60s timer
+    // limbo. The first tool call from claude will overwrite this entry.
+    void markThinking(cardId, `Reading message from ${senderName}…`);
 
     const msg = [
       `<channel source="is-team" cardId="${cardId}" type="chat_message">`,
@@ -2044,8 +2298,21 @@ registerWorkspaceTool("batch_delete_nodes", "Batch Delete Nodes",
 const transport = new StdioServerTransport();
 await server.connect(transport);
 
+// Skip session/presence registration entirely when this MCP server is launched
+// as a *child of claude --mcp-config* (i.e. by the board-agent daemon, not by
+// a human running Claude Code stdio). The daemon owns the session/presence
+// lifecycle on the same uid, and a child re-registering both was wiping the
+// daemon's `aiPresence` node every time claude exited (because the child's
+// onDisconnect.remove() fires first). Result: badge flickered off → frontend
+// thought no MCP agent was attached → routed user input to Gemini fallback.
+const TOOLS_ONLY_MODE = process.env.IST_MCP_NO_SESSION === "1";
+
 // Register agent session presence after connecting (async, non-blocking)
 (async () => {
+  if (TOOLS_ONLY_MODE) {
+    process.stderr.write("[mcp] IST_MCP_NO_SESSION=1 — running tools-only, skipping session/presence registration.\n");
+    return;
+  }
   try {
     await ensureFirebaseAuth();
 

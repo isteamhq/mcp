@@ -89,7 +89,16 @@ function resolveClaudePath(): string {
  * In --yes mode, synthesize a random one to keep non-interactive callers
  * (CI, scripts) working without prompting.
  */
-async function askAgentName(yesMode: boolean): Promise<string> {
+async function askAgentName(yesMode: boolean, explicit?: string): Promise<string> {
+  // Honour an explicit caller-provided name first — used by the Fly
+  // board-agent runtime, which spawns this setup non-interactively but
+  // still wants the agent badge to match what the user picked in the UI
+  // (rather than a random 6-char id we'd have to surface back somehow).
+  if (explicit) {
+    const norm = explicit.trim().toUpperCase();
+    if (isValidAgentName(norm)) return norm;
+    warn(`--agent-name "${explicit}" is invalid (1-6 [A-Z0-9]); falling back to ${yesMode ? "auto-generated" : "interactive prompt"}.`);
+  }
   if (yesMode) {
     const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let id = "";
@@ -115,6 +124,7 @@ const filteredArgs = args.filter((a) => a !== "setup");
 
 let argToken: string | null = null;
 let argYes = false;
+let argAgentName: string | null = null;
 
 for (let i = 0; i < filteredArgs.length; i++) {
   if (filteredArgs[i] === "--token" && filteredArgs[i + 1]) {
@@ -122,6 +132,9 @@ for (let i = 0; i < filteredArgs.length; i++) {
     i++;
   } else if (filteredArgs[i] === "--yes" || filteredArgs[i] === "-y") {
     argYes = true;
+  } else if (filteredArgs[i] === "--agent-name" && filteredArgs[i + 1]) {
+    argAgentName = filteredArgs[i + 1];
+    i++;
   }
 }
 
@@ -214,7 +227,7 @@ async function main() {
   log("Use a different name in each project/terminal so you can tell your agents apart.");
   log("");
 
-  const agentName = await askAgentName(argYes);
+  const agentName = await askAgentName(argYes, argAgentName ?? process.env.IST_AGENT_NAME ?? undefined);
   log("");
 
   // Step 6: Create/update .mcp.json

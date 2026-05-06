@@ -17,7 +17,16 @@ import { join } from "path";
 
 import { initializeApp } from "firebase/app";
 import { getAuth, signInWithCustomToken } from "firebase/auth";
-import { getFirestore, doc, onSnapshot, type Unsubscribe } from "firebase/firestore";
+import {
+  getFirestore,
+  doc,
+  collection,
+  query,
+  where,
+  orderBy,
+  onSnapshot,
+  type Unsubscribe,
+} from "firebase/firestore";
 import {
   getDatabase,
   ref as rtdbRef,
@@ -232,7 +241,14 @@ async function heartbeat(): Promise<void> {
   await onDisconnect(sessionRef).remove();
 
   if (currentCard) {
+    // Always re-set presence (not just re-register onDisconnect). A stale
+    // onDisconnect can wipe it on a websocket reconnect; if we only refresh
+    // the handler the badge stays gone until the next attachCard, which means
+    // the frontend's `useAiPresence` flips to false and routes the user's
+    // chat to the built-in Gemini path instead of our daemon. Idempotent
+    // write is cheap and fixes the flapping.
     const presenceRef = rtdbRef(rtdb, `${PRESENCE_ROOT}/${cfg.workspaceId}/${currentCard.nodeId}/${uid}`);
+    await rtdbSet(presenceRef, { active: true, subscribedAt: Date.now(), daemon: true });
     await onDisconnect(presenceRef).remove();
   }
 }
@@ -400,36 +416,50 @@ async function postChat(msg: string): Promise<void> {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Task queue                                                          */
+/*  Work queue (tasks + chat messages)                                  */
 /* ------------------------------------------------------------------ */
 
 interface QueuedTask {
+  kind: "task";
   id: string;
   taskNumber: number;
   title: string;
 }
 
-const queue: QueuedTask[] = [];
+interface QueuedChat {
+  kind: "chat";
+  /** Firestore message id — also doubles as the dedupe key. */
+  id: string;
+  /** Author of the user-side message. */
+  senderName: string;
+  /** Raw message body forwarded to claude as the prompt. */
+  content: string;
+}
+
+type QueuedItem = QueuedTask | QueuedChat;
+
+const queue: QueuedItem[] = [];
 const processedTaskIds = new Set<string>();
+const processedChatIds = new Set<string>();
 let working = false;
 
-function queueFile(taskId: string): string {
-  return join(DAEMON_QUEUE_DIR, `${taskId}.json`);
+function queueFile(id: string): string {
+  return join(DAEMON_QUEUE_DIR, `${id}.json`);
 }
 
-function persistQueueEntry(t: QueuedTask): void {
-  try { writeFileSync(queueFile(t.id), JSON.stringify(t)); } catch { /* ignore */ }
+function persistQueueEntry(item: QueuedItem): void {
+  try { writeFileSync(queueFile(item.id), JSON.stringify(item)); } catch { /* ignore */ }
 }
 
-function removeQueueEntry(taskId: string): void {
-  try { if (existsSync(queueFile(taskId))) unlinkSync(queueFile(taskId)); } catch { /* ignore */ }
+function removeQueueEntry(id: string): void {
+  try { if (existsSync(queueFile(id))) unlinkSync(queueFile(id)); } catch { /* ignore */ }
 }
 
 /* ------------------------------------------------------------------ */
 /*  Claude spawn                                                        */
 /* ------------------------------------------------------------------ */
 
-function buildPrompt(task: QueuedTask): string {
+function buildTaskPrompt(task: QueuedTask): string {
   // Tasks only flow in when we are attached to a card, so currentCard is set
   // here. Fall back to legacy cfg fields just in case to keep this routine
   // safe under unusual race conditions (e.g. detach mid-dispatch).
@@ -452,23 +482,67 @@ function buildPrompt(task: QueuedTask): string {
   ].join("\n");
 }
 
-function runClaude(task: QueuedTask): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+function buildChatPrompt(chat: QueuedChat): string {
+  // Conversational counterpart to buildTaskPrompt — the user just sent a chat
+  // message on the subscribed card and expects a reply, not a full task run.
+  // Keep this prompt TIGHT: tool-use license here is what runs the container
+  // out of memory on small Fly tiers (claude OOM-killed at 5min on a single
+  // "selam" because the model wandered into read_card + list_cards before
+  // replying).
+  const cardId    = currentCard?.cardId ?? cfg.agentCardId ?? "(unknown card)";
+  const cardTitle = cfg.cardTitle ?? "(card)";
+  return [
+    `You are the is.team autonomous agent for card "${cardTitle}" (id: ${cardId}).`,
+    ``,
+    `A user just sent this message in the card chat:`,
+    `  ${chat.senderName}: ${chat.content}`,
+    ``,
+    `Reply with ONE call to chat_respond and exit immediately. Do not call any other tools unless the user explicitly asked you to look something up or do something. Keep the reply short — one or two sentences.`,
+    ``,
+    `Required call shape: chat_respond({ cardId: "${cardId}", content: "<your reply>" })`,
+  ].join("\n");
+}
+
+function buildPrompt(item: QueuedItem): string {
+  return item.kind === "task" ? buildTaskPrompt(item) : buildChatPrompt(item);
+}
+
+/** Per-image path the entrypoint writes to. Pass via --mcp-config so claude
+ *  loads the is-team MCP server (chat_respond, read_card, complete_task, …)
+ *  on every spawn. Without it the chat prompt's "respond via chat_respond"
+ *  instruction silently no-ops because the tool isn't registered. */
+const CLAUDE_MCP_CONFIG_PATH = "/root/.isteam/mcp.json";
+
+function runClaude(item: QueuedItem): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     const args = [
       "--print",
       "--permission-mode", cfg.permissionMode,
+      "--mcp-config", CLAUDE_MCP_CONFIG_PATH,
     ];
     if (cfg.permissionMode === "bypassPermissions") {
       // Claude expects --dangerously-skip-permissions for fully autonomous mode
       args.push("--dangerously-skip-permissions");
     }
-    args.push(buildPrompt(task));
+    args.push(buildPrompt(item));
 
-    logInfo(`spawning claude for task #${task.taskNumber} (id ${task.id})`);
+    const label = item.kind === "task"
+      ? `task #${item.taskNumber} (id ${item.id})`
+      : `chat ${item.id} from ${item.senderName}`;
+    logInfo(`spawning claude for ${label}`);
 
+    // Forward IST_* to claude → MCP server child. Entrypoint unsets these
+    // after writing daemon.json, so process.env doesn't have them — we have
+    // to rebuild the bag from cfg every spawn.
     const child = spawn(cfg.claudePath, args, {
       cwd: cfg.workingDir,
-      env: { ...process.env, IST_API_TOKEN: cfg.token },
+      env: {
+        ...process.env,
+        IST_API_TOKEN:   cfg.token,
+        IST_BASE_URL:    cfg.baseUrl,
+        IST_AGENT_NAME:  cfg.agentName,
+        IST_WORKSPACE_ID: cfg.workspaceId,
+      },
       stdio: ["ignore", "pipe", "pipe"],
     });
 
@@ -482,11 +556,16 @@ function runClaude(task: QueuedTask): Promise<{ exitCode: number; stdout: string
     child.stderr?.on("data", (chunk) => {
       const s = chunk.toString();
       stderr += s;
+      // Mirror to fly logs so we don't have to SSH into the machine and read
+      // /root/.isteam/daemon-error.log to debug a crash.
+      for (const ln of s.split("\n")) {
+        if (ln.trim()) logError(`[claude stderr] ${ln}`);
+      }
       try { appendFileSync(DAEMON_ERROR_LOG, s); } catch { /* ignore */ }
     });
 
     const timeout = setTimeout(() => {
-      logError(`task #${task.taskNumber} timed out after 30 minutes — killing`);
+      logError(`${label} timed out after 30 minutes — killing`);
       child.kill("SIGTERM");
       setTimeout(() => child.kill("SIGKILL"), 5000);
     }, 30 * 60 * 1000);
@@ -504,29 +583,63 @@ function runClaude(task: QueuedTask): Promise<{ exitCode: number; stdout: string
 
 async function processQueue(): Promise<void> {
   if (working) return;
-  const task = queue.shift();
-  if (!task) return;
+  const item = queue.shift();
+  if (!item) return;
   working = true;
   await setStatus("working");
 
-  logInfo(`→ starting task #${task.taskNumber}: ${task.title}`);
-  await postChat(`🤖 Agent started task #${task.taskNumber} — ${task.title}`);
+  // Tasks get a "starting" announcement; chat replies don't, since the user
+  // is already watching the chat thread and a "starting" line is just noise.
+  if (item.kind === "task") {
+    logInfo(`→ starting task #${item.taskNumber}: ${item.title}`);
+    await postChat(`🤖 Agent started task #${item.taskNumber} — ${item.title}`);
+  } else {
+    logInfo(`→ starting chat reply (msg ${item.id} from ${item.senderName})`);
+  }
 
   try {
-    const { exitCode, stdout } = await runClaude(task);
-    removeQueueEntry(task.id);
+    const { exitCode, stdout, stderr } = await runClaude(item);
+    removeQueueEntry(item.id);
 
-    const summary = stdout.trim().slice(-1500) || "(no output)";
-    if (exitCode === 0) {
-      logInfo(`✓ task #${task.taskNumber} completed`);
-      await postChat(`✅ Agent finished task #${task.taskNumber}.\n\n\`\`\`\n${summary}\n\`\`\``);
+    const stdoutTail = stdout.trim().slice(-1500);
+    const stderrTail = stderr.trim().slice(-1500);
+    // On failure, the actually useful signal is in stderr, not stdout. Prefer
+    // it when both are present so the user doesn't have to dig through logs.
+    const failureBody = stderrTail || stdoutTail || "(no output)";
+    const successBody = stdoutTail || "(no output)";
+
+    if (item.kind === "task") {
+      if (exitCode === 0) {
+        logInfo(`✓ task #${item.taskNumber} completed`);
+        await postChat(`✅ Agent finished task #${item.taskNumber}.\n\n\`\`\`\n${successBody}\n\`\`\``);
+      } else {
+        logError(`✗ task #${item.taskNumber} exited ${exitCode}`);
+        await postChat(`⚠️ Agent exited with code ${exitCode} on task #${item.taskNumber}.\n\n\`\`\`\n${failureBody}\n\`\`\``);
+      }
     } else {
-      logError(`✗ task #${task.taskNumber} exited ${exitCode}`);
-      await postChat(`⚠️ Agent exited with code ${exitCode} on task #${task.taskNumber}. Check daemon logs.\n\n\`\`\`\n${summary}\n\`\`\``);
+      // For chat replies, claude is *expected* to call chat_respond itself,
+      // but we can't trust it to always pick the tool path — sometimes the
+      // model just emits plain text and exits 0 silently, leaving the user
+      // staring at an empty thread. Always post stdout as a fallback when it
+      // contains anything beyond noise. Worst case: the user sees a doubled
+      // reply (chat_respond + stdout); much better than the silent failure.
+      if (exitCode === 0) {
+        logInfo(`✓ chat reply ${item.id} completed (stdout ${stdoutTail.length} chars)`);
+        if (stdoutTail.length > 0) {
+          await postChat(stdoutTail);
+        } else {
+          // No stdout AND no chat_respond call — surface to the user so they
+          // know the agent ran but didn't speak. Otherwise it looks frozen.
+          await postChat(`(agent ran but produced no reply — check daemon logs)`);
+        }
+      } else {
+        logError(`✗ chat reply ${item.id} exited ${exitCode}`);
+        await postChat(`⚠️ Agent crashed while replying (exit ${exitCode}).\n\n\`\`\`\n${failureBody}\n\`\`\``);
+      }
     }
   } catch (err) {
-    logError(`task #${task.taskNumber} failed: ${String(err)}`);
-    await postChat(`⚠️ Agent crashed on task #${task.taskNumber}: ${String(err)}`);
+    logError(`${item.kind} ${item.id} failed: ${String(err)}`);
+    await postChat(`⚠️ Agent crashed: ${String(err)}`);
   } finally {
     working = false;
     await setStatus("subscribed");
@@ -540,9 +653,20 @@ async function processQueue(): Promise<void> {
 /* ------------------------------------------------------------------ */
 
 let nodeUnsub: Unsubscribe | null = null;
-let initialLoad = true;
+let chatUnsub: Unsubscribe | null = null;
+let initialLoad     = true;
+let chatInitialLoad = true;
+/** Floor for chat-listener events — anything older is treated as "history". */
+let chatBaselineTs  = 0;
 
 type TaskEntry = { id: string; title?: string; taskNumber?: number };
+type ChatMessageDoc = {
+  role?:         string;       // "user" | "assistant" | "system"
+  content?:      string;
+  timestamp?:    number;
+  senderName?:   string;
+  isAutomation?: boolean;
+};
 
 /**
  * Stop watching the current card. Keeps the daemon process alive and the
@@ -551,8 +675,12 @@ type TaskEntry = { id: string; title?: string; taskNumber?: number };
  */
 function detachCard(): void {
   if (nodeUnsub) { nodeUnsub(); nodeUnsub = null; }
+  if (chatUnsub) { chatUnsub(); chatUnsub = null; }
   processedTaskIds.clear();
-  initialLoad = true;
+  processedChatIds.clear();
+  initialLoad     = true;
+  chatInitialLoad = true;
+  chatBaselineTs  = 0;
 
   const prev = currentCard;
   currentCard = null;
@@ -575,9 +703,12 @@ async function attachCard(card: { cardId: string; boardId: string; nodeId: strin
   if (currentCard && currentCard.nodeId === card.nodeId) return;
   detachCard();
 
-  currentCard = card;
-  initialLoad = true;
+  currentCard      = card;
+  initialLoad      = true;
+  chatInitialLoad  = true;
+  chatBaselineTs   = Date.now();
   processedTaskIds.clear();
+  processedChatIds.clear();
 
   // Sync RTDB: session status + assignedCard so the UI badge lands on this
   // card, and aiPresence so the "MCP Subscribed" glow appears.
@@ -616,6 +747,7 @@ async function attachCard(card: { cardId: string; boardId: string; nodeId: strin
       if (processedTaskIds.has(t.id)) continue;
       processedTaskIds.add(t.id);
       const entry: QueuedTask = {
+        kind: "task",
         id: t.id,
         taskNumber: t.taskNumber ?? 0,
         title: t.title ?? "(untitled)",
@@ -636,7 +768,61 @@ async function attachCard(card: { cardId: string; boardId: string; nodeId: strin
     logError(`firestore listener error: ${String(err)}`);
   });
 
-  logInfo(`attached to card ${card.cardId}`);
+  // ── Chat listener ──────────────────────────────────────────────────────────
+  // Watches `canvasNodes/{nodeId}/chatMessages` for new user messages and
+  // queues each one for a claude-driven reply. Filters:
+  //   - role === "user" (skip assistant + system; assistant entries are our
+  //     own chat_respond writes coming back through the listener)
+  //   - timestamp >= chatBaselineTs (ignore historical messages on first load)
+  //   - dedupe by message id (Firestore can replay docs on reconnect)
+  const chatRef = collection(
+    db,
+    "workspaces", cfg.workspaceId,
+    "boards",      card.boardId,
+    "canvasNodes", card.nodeId,
+    "chatMessages",
+  );
+  const chatQuery = query(chatRef, where("timestamp", ">=", chatBaselineTs), orderBy("timestamp", "asc"));
+  chatUnsub = onSnapshot(chatQuery, (snap) => {
+    if (chatInitialLoad) {
+      // First snapshot is the post-baseline window — usually empty, but if
+      // there are any in-flight messages mark them processed so we don't
+      // immediately reply to a stale prompt.
+      for (const d of snap.docs) processedChatIds.add(d.id);
+      chatInitialLoad = false;
+      return;
+    }
+
+    for (const change of snap.docChanges()) {
+      if (change.type !== "added") continue;
+      const doc = change.doc;
+      if (processedChatIds.has(doc.id)) continue;
+
+      const data = doc.data() as ChatMessageDoc;
+      // Only react to genuine user messages — never our own automation
+      // posts (would feedback-loop) or system events.
+      if (data.role !== "user") continue;
+      if (data.isAutomation) continue;
+      if (typeof data.content !== "string" || !data.content.trim()) continue;
+
+      processedChatIds.add(doc.id);
+      const entry: QueuedChat = {
+        kind:       "chat",
+        id:         doc.id,
+        senderName: data.senderName ?? "user",
+        content:    data.content.trim(),
+      };
+      persistQueueEntry(entry);
+      queue.push(entry);
+      logInfo(`queued chat ${entry.id} from ${entry.senderName}: ${entry.content.slice(0, 60)}${entry.content.length > 60 ? "…" : ""}`);
+    }
+
+    if (!working && queue.length > 0) processQueue();
+  }, (err) => {
+    logError(`chat listener error: ${String(err)}`);
+  });
+
+  logInfo(`attached to card ${card.cardId} (tasks + chat)`);
 }
 
 /**

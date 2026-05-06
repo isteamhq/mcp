@@ -6,19 +6,27 @@
 export class IsTeamClient {
   private baseUrl: string;
   private token: string;
+  /** Badge name (e.g. "MP6JBN") forwarded as a header so the server can stamp
+   *  it on chat_respond messages — otherwise every reply lands as "Automation"
+   *  in the UI and the user can't tell which agent spoke. */
+  private agentName: string | undefined;
 
   constructor(baseUrl: string, token: string) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
     this.token = token;
+    const raw = process.env.IST_AGENT_NAME?.trim();
+    this.agentName = raw && /^[A-Z0-9]{1,6}$/.test(raw.toUpperCase()) ? raw.toUpperCase() : undefined;
   }
 
   async executeTool(tool: string, cardId?: string, args?: Record<string, unknown>): Promise<string> {
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${this.token}`,
+      "Content-Type": "application/json",
+    };
+    if (this.agentName) headers["X-Agent-Name"] = this.agentName;
     const res = await fetch(`${this.baseUrl}/api/mcp/exec`, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${this.token}`,
-        "Content-Type": "application/json",
-      },
+      headers,
       body: JSON.stringify({ tool, cardId, args: args ?? {} }),
     });
     return res.text();
@@ -72,17 +80,25 @@ export class IsTeamClient {
     return this.executeTool("ask_chat", cardId, { question, type, ...(options?.length ? { options } : {}) });
   }
 
+  /** Generic dispatcher for the structured "agent_action" UI cards (Drive/Github
+   *  offers, share preview, task plan, …). Each tool is just sugar over this. */
+  async agentAction(tool: string, cardId: string, content: string, payload: Record<string, unknown>): Promise<string> {
+    return this.executeTool(tool, cardId, { content, payload });
+  }
+
   /* ── Workspace-scoped tools (integrations, board/card/member CRUD…) ─ */
 
   /** Generic workspace-scoped tool call — used by every tool that takes a
    *  workspaceId rather than a cardId (integrations + Sprint 1+ primitives). */
   async executeWorkspaceTool(tool: string, workspaceId: string, args?: Record<string, unknown>): Promise<string> {
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${this.token}`,
+      "Content-Type": "application/json",
+    };
+    if (this.agentName) headers["X-Agent-Name"] = this.agentName;
     const res = await fetch(`${this.baseUrl}/api/mcp/exec`, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${this.token}`,
-        "Content-Type": "application/json",
-      },
+      headers,
       body: JSON.stringify({ tool, workspaceId, args: args ?? {} }),
     });
     return res.text();
