@@ -1073,11 +1073,13 @@ registerAgentAction(
 registerAgentAction(
   "confirm_destructive",
   "Confirm a Destructive Action",
-  "Render a red, friction-heavy confirmation card BEFORE any irreversible action (delete repo, drop database, force-push to main, wipe /workspace). Optional `requireType` field demands the user re-type a specific string to proceed.",
+  "REQUIRED before any destructive tool (delete_card, delete_note, delete_task, delete_board, batch_delete_nodes, remove_member, github_merge_pr, github_close_pr, github_close_issue, slack_archive_channel, drive_delete_file, delete_file). Renders a red confirmation card and returns a `confirmationId`. The destructive call is REJECTED by the server until a human clicks approve on that card — you cannot approve on the user's behalf. Pass `tool` and `target` so the approval is bound to exactly this action, then retry the destructive tool with `confirmationId`. Approvals expire after 10 minutes and are single-use.",
   {
     action:      z.string().describe("Short label of the action (e.g. 'Delete repository my-project')"),
     danger:      z.string().describe("One-sentence explanation of what could go wrong"),
     requireType: z.string().optional().describe("If set, user must type this exact string to confirm"),
+    tool:        z.string().describe("Exact name of the destructive tool this approval is for (e.g. 'delete_task')"),
+    target:      z.string().describe("Identifier of what will be affected, matching the destructive call's own argument (e.g. 'taskNumber=4')"),
   },
 );
 
@@ -1194,6 +1196,7 @@ registerIntegrationTool("github_update_repo", "GitHub: Update Repo",
   }, false);
 registerIntegrationTool("github_merge_pr", "GitHub: Merge PR",
   "Merge a pull request.", {
+    confirmationId: z.string().describe("Approval id returned by confirm_destructive AFTER a human approved it. Required — the server rejects this call without it."),
     repo: z.string().describe("Repository full name"),
     pullNumber: zNum("Pull request number"),
     mergeMethod: z.enum(["merge", "squash", "rebase"]).optional().describe("Merge method (default: merge)"),
@@ -1201,11 +1204,13 @@ registerIntegrationTool("github_merge_pr", "GitHub: Merge PR",
   }, false);
 registerIntegrationTool("github_close_pr", "GitHub: Close PR",
   "Close a pull request without merging.", {
+    confirmationId: z.string().describe("Approval id returned by confirm_destructive AFTER a human approved it. Required — the server rejects this call without it."),
     repo: z.string().describe("Repository full name"),
     pullNumber: zNum("Pull request number"),
   }, false);
 registerIntegrationTool("github_close_issue", "GitHub: Close Issue",
   "Close a GitHub issue.", {
+    confirmationId: z.string().describe("Approval id returned by confirm_destructive AFTER a human approved it. Required — the server rejects this call without it."),
     repo: z.string().describe("Repository full name"),
     issueNumber: zNum("Issue number"),
   }, false);
@@ -1247,6 +1252,7 @@ registerIntegrationTool("drive_create_folder", "Drive: Create Folder",
   }, false);
 registerIntegrationTool("drive_delete_file", "Drive: Delete File",
   "Delete a file or folder from Google Drive.", {
+    confirmationId: z.string().describe("Approval id returned by confirm_destructive AFTER a human approved it. Required — the server rejects this call without it."),
     fileId: z.string().describe("Google Drive file or folder ID"),
   }, false);
 registerIntegrationTool("drive_update_file", "Drive: Update File",
@@ -1282,6 +1288,7 @@ registerIntegrationTool("slack_create_channel", "Slack: Create Channel",
   }, false);
 registerIntegrationTool("slack_archive_channel", "Slack: Archive Channel",
   "Archive a Slack channel.", {
+    confirmationId: z.string().describe("Approval id returned by confirm_destructive AFTER a human approved it. Required — the server rejects this call without it."),
     channel: z.string().describe("Channel ID"),
   }, false);
 registerIntegrationTool("slack_update_channel", "Slack: Update Channel",
@@ -1809,6 +1816,7 @@ registerWorkspaceTool("update_board", "Update Board",
 registerWorkspaceTool("delete_board", "Delete Board",
   "Permanently delete a board AND every card/note/edge inside it. Owner only. This cannot be undone.",
   {
+    confirmationId: z.string().describe("Approval id returned by confirm_destructive AFTER a human approved it. Required — the server rejects this call without it."),
     boardId: z.string().describe("Board ID"),
   }, false, true);
 
@@ -1879,6 +1887,7 @@ registerWorkspaceTool("update_card_settings", "Update Card Settings",
 registerWorkspaceTool("delete_card", "Delete Card",
   "Permanently delete a card and every connected edge. Tasks inside the card are removed with it. Cannot be undone.",
   {
+    confirmationId: z.string().describe("Approval id returned by confirm_destructive AFTER a human approved it. Required — the server rejects this call without it."),
     boardId: z.string().describe("Board ID"),
     cardId:  z.string().describe("Card ID to delete"),
   }, false, true);
@@ -1901,6 +1910,7 @@ registerWorkspaceTool("list_edges", "List Edges",
 registerWorkspaceTool("delete_note", "Delete Note",
   "Permanently delete a note from the canvas along with any edges connected to it.",
   {
+    confirmationId: z.string().describe("Approval id returned by confirm_destructive AFTER a human approved it. Required — the server rejects this call without it."),
     boardId: z.string().describe("Board ID"),
     noteId:  z.string().describe("Note ID (e.g. note-1773256154568)"),
   }, false, true);
@@ -1908,6 +1918,7 @@ registerWorkspaceTool("delete_note", "Delete Note",
 registerWorkspaceTool("delete_task", "Delete Task",
   "Permanently delete a single task from a card. To remove without losing history, prefer update_task with archived=true.",
   {
+    confirmationId: z.string().describe("Approval id returned by confirm_destructive AFTER a human approved it. Required — the server rejects this call without it."),
     boardId:    z.string().describe("Board ID containing the card"),
     cardId:     z.string().describe("Card ID containing the task"),
     taskNumber: zNum("Task number to delete"),
@@ -1993,6 +2004,7 @@ registerWorkspaceTool("list_files", "List Workspace Files",
 registerWorkspaceTool("delete_file", "Delete File",
   "Permanently delete a file from storage AND its Firestore record. Uploader or workspace owner only.",
   {
+    confirmationId: z.string().describe("Approval id returned by confirm_destructive AFTER a human approved it. Required — the server rejects this call without it."),
     fileId: z.string().describe("File ID"),
   }, false, true);
 
@@ -2062,6 +2074,7 @@ registerWorkspaceTool("update_member_role", "Update Member Role",
 registerWorkspaceTool("remove_member", "Remove Member",
   "Remove a member from the workspace. Last-owner protection enforced. Cannot remove yourself (use leave_workspace). Owner only.",
   {
+    confirmationId: z.string().describe("Approval id returned by confirm_destructive AFTER a human approved it. Required — the server rejects this call without it."),
     targetUid: z.string().describe("Target member UID"),
   }, false, true);
 
@@ -2287,6 +2300,7 @@ registerWorkspaceTool("batch_move_nodes", "Batch Move Nodes",
 registerWorkspaceTool("batch_delete_nodes", "Batch Delete Nodes",
   "Delete many canvas nodes in one call (cards/notes/stacks) and any edges connected to them. Max 200 nodes per call. Cannot be undone.",
   {
+    confirmationId: z.string().describe("Approval id returned by confirm_destructive AFTER a human approved it. Required — the server rejects this call without it."),
     boardId: z.string().describe("Board ID"),
     nodeIds: z.array(z.string()).describe("Array of node IDs to delete"),
   }, false, true);
